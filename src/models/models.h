@@ -866,6 +866,11 @@ struct llama_model_gemma4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    void init_adapter_weights();
+    void init_extra_weights() override {
+        init_adapter_weights();
+    }
+
     struct graph : public llm_graph_context {
         const llama_model & model;
 

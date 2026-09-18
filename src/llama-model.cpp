@@ -1221,6 +1221,9 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    if (adapter_buf) {
+        ggml_backend_buffer_free(adapter_buf);
+    }
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1878,6 +1881,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    init_extra_weights();
 
     return true;
 }

@@ -649,7 +649,7 @@ int cli_context::run() {
 
         if (params.show_timings) {
             ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s | \033[1;36m\xE2\x9A\xA1 Sinusoid Adapter: Active (Fork L24, Merge L26)\033[0m ]",
                 timings.prompt_per_second,
                 timings.predicted_per_second
             ));

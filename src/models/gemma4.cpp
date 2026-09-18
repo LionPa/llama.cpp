@@ -1,4 +1,7 @@
 #include "models.h"
+#include "ggml-alloc.h"
+#include <fstream>
+#include <vector>
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -140,7 +143,85 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+void llama_model_gemma4::init_adapter_weights() {
+    if (w_merge_1 != nullptr || hparams.n_layer() <= 29) {
+        return;
+    }
+
+    auto * target_layer_tensor = layers[25].ffn_down;
+    if (!target_layer_tensor || !target_layer_tensor->buffer) {
+        return;
+    }
+
+    auto * buft = ggml_backend_buffer_get_type(target_layer_tensor->buffer);
+    const size_t ctx_size = ggml_tensor_overhead() * 8;
+    struct ggml_init_params p = { ctx_size, nullptr, true };
+    struct ggml_context * actx = ggml_init(p);
+
+    const int64_t n_embd = hparams.n_embd;
+
+    w_merge_1   = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, n_embd);
+    ggml_set_name(w_merge_1, "w_merge_1");
+
+    gate_proj_1 = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, 1);
+    ggml_set_name(gate_proj_1, "gate_proj_1");
+
+    w_merge_2   = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, n_embd);
+    ggml_set_name(w_merge_2, "w_merge_2");
+
+    gate_proj_2 = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, 1);
+    ggml_set_name(gate_proj_2, "gate_proj_2");
+
+    adapter_buf = ggml_backend_alloc_ctx_tensors_from_buft(actx, buft);
+    if (adapter_buf) {
+        std::vector<uint8_t> zeros_w(ggml_nbytes(w_merge_1), 0);
+        std::vector<uint8_t> zeros_g(ggml_nbytes(gate_proj_1), 0);
+
+        ggml_backend_tensor_set(w_merge_1, zeros_w.data(), 0, zeros_w.size());
+        ggml_backend_tensor_set(gate_proj_1, zeros_g.data(), 0, zeros_g.size());
+        ggml_backend_tensor_set(w_merge_2, zeros_w.data(), 0, zeros_w.size());
+        ggml_backend_tensor_set(gate_proj_2, zeros_g.data(), 0, zeros_g.size());
+
+        // Stage 1 (Layers 24-26)
+        std::ifstream fw1("w_merge_1.bin", std::ios::binary);
+        if (fw1.is_open()) {
+            std::vector<char> data(ggml_nbytes(w_merge_1));
+            fw1.read(data.data(), data.size());
+            ggml_backend_tensor_set(w_merge_1, data.data(), 0, data.size());
+            fprintf(stderr, "\n\033[1;32m[Cascade Latent Adapter]\033[0m Stage 1 (L24-L26) loaded w_merge_1.bin (%.2f MB)\n", data.size() / (1024.0 * 1024.0));
+            fflush(stderr);
+        }
+        std::ifstream fg1("gate_1.bin", std::ios::binary);
+        if (fg1.is_open()) {
+            std::vector<char> data(ggml_nbytes(gate_proj_1));
+            fg1.read(data.data(), data.size());
+            ggml_backend_tensor_set(gate_proj_1, data.data(), 0, data.size());
+            fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage 1 gate_1.bin (%.2f KB) active\n", data.size() / 1024.0);
+            fflush(stderr);
+        }
+
+        // Stage 2 (Layers 27-29)
+        std::ifstream fw2("w_merge_2.bin", std::ios::binary);
+        if (fw2.is_open()) {
+            std::vector<char> data(ggml_nbytes(w_merge_2));
+            fw2.read(data.data(), data.size());
+            ggml_backend_tensor_set(w_merge_2, data.data(), 0, data.size());
+            fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage 2 (L27-L29) loaded w_merge_2.bin (%.2f MB)\n", data.size() / (1024.0 * 1024.0));
+            fflush(stderr);
+        }
+        std::ifstream fg2("gate_2.bin", std::ios::binary);
+        if (fg2.is_open()) {
+            std::vector<char> data(ggml_nbytes(gate_proj_2));
+            fg2.read(data.data(), data.size());
+            ggml_backend_tensor_set(gate_proj_2, data.data(), 0, data.size());
+            fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage 2 gate_2.bin (%.2f KB) active\n\n", data.size() / 1024.0);
+            fflush(stderr);
+        }
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_gemma4::build_arch_graph(const llm_graph_params & params) const {
+    const_cast<llama_model_gemma4 *>(this)->init_adapter_weights();
     return std::make_unique<graph>(*this, params);
 }
 
@@ -180,6 +261,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         // inp_per_layer shape: [n_embd_per_layer, n_tokens, n_layer]
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
+
+    ggml_tensor * alt1 = nullptr;
+    ggml_tensor * alt2 = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
@@ -396,6 +480,63 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        // --- STAGE 1 (Layers 24-26, indices 23-25) ---
+        if (il == 23) {
+            alt1 = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), 0.05f));
+            cb(alt1, "fork_alt1", il);
+        } else if (il == 24 || il == 25) {
+            if (alt1) {
+                ggml_tensor * norm1 = build_norm(alt1, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * ffn1  = build_ffn(norm1,
+                        model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
+                        model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
+                        model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
+                        nullptr, LLM_FFN_GELU, LLM_FFN_PAR, il);
+                ffn1 = build_norm(ffn1, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
+                alt1 = ggml_add(ctx0, alt1, ffn1);
+                cb(alt1, "alt1_incubated", il);
+            }
+        }
+
+        if (il == 25 && alt1 && model.w_merge_1) {
+            ggml_tensor * alt1_proj = ggml_mul_mat(ctx0, model.w_merge_1, alt1);
+            if (model.gate_proj_1) {
+                ggml_tensor * gate1 = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, model.gate_proj_1, alt1));
+                alt1_proj = ggml_mul(ctx0, alt1_proj, gate1);
+            }
+            cur = ggml_add(ctx0, cur, alt1_proj);
+            cb(cur, "fused_out_1", il);
+        }
+
+        // --- STAGE 2 (Layers 27-29, indices 26-28) ---
+        if (il == 26) {
+            // Stage 2 starts from 'cur', which already contains the Stage 1 fused lookahead thought!
+            alt2 = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), 0.05f));
+            cb(alt2, "fork_alt2", il);
+        } else if (il == 27 || il == 28) {
+            if (alt2) {
+                ggml_tensor * norm2 = build_norm(alt2, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * ffn2  = build_ffn(norm2,
+                        model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
+                        model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
+                        model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
+                        nullptr, LLM_FFN_GELU, LLM_FFN_PAR, il);
+                ffn2 = build_norm(ffn2, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
+                alt2 = ggml_add(ctx0, alt2, ffn2);
+                cb(alt2, "alt2_incubated", il);
+            }
+        }
+
+        if (il == 28 && alt2 && model.w_merge_2) {
+            ggml_tensor * alt2_proj = ggml_mul_mat(ctx0, model.w_merge_2, alt2);
+            if (model.gate_proj_2) {
+                ggml_tensor * gate2 = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, model.gate_proj_2, alt2));
+                alt2_proj = ggml_mul(ctx0, alt2_proj, gate2);
+            }
+            cur = ggml_add(ctx0, cur, alt2_proj);
+            cb(cur, "fused_out_2", il);
+        }
 
         // input for next layer
         inpL = cur;

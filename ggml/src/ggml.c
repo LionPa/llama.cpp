@@ -7190,6 +7190,20 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        struct ggml_tensor * gt = ggml_mul(ctx, grad, tensor);
+                        struct ggml_tensor * d  = ggml_sub(ctx, gt, ggml_mul(ctx, gt, tensor));
+                        ggml_add_or_set(ctx, cgraph, isrc0, d);
+                    }
+                } break;
+                case GGML_UNARY_OP_TANH: {
+                    if (src0_needs_grads) {
+                        struct ggml_tensor * gt = ggml_mul(ctx, grad, tensor);
+                        struct ggml_tensor * d  = ggml_sub(ctx, grad, ggml_mul(ctx, gt, tensor));
+                        ggml_add_or_set(ctx, cgraph, isrc0, d);
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
@@ -7212,6 +7226,17 @@ static void ggml_compute_backward(
                     }
                     if (src1_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                    }
+                } break;
+                case GGML_GLU_OP_GEGLU:
+                case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_GEGLU_ERF: {
+                    if (src0_needs_grads) {
+                        GGML_ASSERT(src1 && "backward pass only implemented for split geglu");
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, ggml_mul(ctx, grad, src1), src0));
+                    }
+                    if (src1_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_gelu(ctx, src0), grad));
                     }
                 } break;
                 default: {

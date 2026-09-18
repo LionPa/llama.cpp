@@ -684,6 +684,12 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
+    struct ggml_tensor * w_merge_1   = nullptr;
+    struct ggml_tensor * gate_proj_1 = nullptr;
+    struct ggml_tensor * w_merge_2   = nullptr;
+    struct ggml_tensor * gate_proj_2 = nullptr;
+    ggml_backend_buffer_t adapter_buf = nullptr;
+
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
@@ -799,6 +805,8 @@ struct llama_model_base : public llama_model {
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
+
+    virtual void init_extra_weights() {}
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
