@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-model.h"
 
 #include <clocale>
 #include <cstdio>
@@ -43,8 +44,7 @@ struct stage_collector {
 };
 
 struct cascade_collector {
-    stage_collector s1;
-    stage_collector s2;
+    stage_collector stages[llama_cascade_config::NUM_STAGES];
 };
 
 static bool latent_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -56,47 +56,36 @@ static bool latent_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     auto * col = (cascade_collector *) user_data;
+    const std::string name(t->name);
 
-    // --- STAGE 1 (Layers 24-26) ---
-    if (std::strcmp(t->name, "l_out-25") == 0) {
-        const size_t n_bytes = ggml_nbytes(t);
-        col->s1.buf_main.resize(n_bytes / sizeof(float));
-        ggml_backend_tensor_get(t, col->s1.buf_main.data(), 0, n_bytes);
-        col->s1.has_main = true;
-        col->s1.n_tokens_curr = t->ne[1];
-    } else if (std::strcmp(t->name, "alt1_incubated-25") == 0) {
-        const size_t n_bytes = ggml_nbytes(t);
-        col->s1.buf_alt.resize(n_bytes / sizeof(float));
-        ggml_backend_tensor_get(t, col->s1.buf_alt.data(), 0, n_bytes);
-        col->s1.has_alt = true;
-    } else if (std::strcmp(t->name, "l_out-28") == 0) {
-        const size_t n_bytes = ggml_nbytes(t);
-        col->s1.buf_target.resize(n_bytes / sizeof(float));
-        ggml_backend_tensor_get(t, col->s1.buf_target.data(), 0, n_bytes);
-        col->s1.has_target = true;
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        const int32_t merge_l  = llama_cascade_config::get_merge_layer(s);
+        const int32_t target_l = merge_l + 3;
 
-        // Stage 2 main input is also at layer 29 (index 28)
-        col->s2.buf_main.resize(n_bytes / sizeof(float));
-        ggml_backend_tensor_get(t, col->s2.buf_main.data(), 0, n_bytes);
-        col->s2.has_main = true;
-        col->s2.n_tokens_curr = t->ne[1];
+        const std::string expected_alt    = "alt_incubated_" + std::to_string(s + 1) + "-" + std::to_string(merge_l);
+        const std::string expected_main   = "l_out-" + std::to_string(merge_l);
+        const std::string expected_target = "l_out-" + std::to_string(target_l);
+
+        if (name == expected_alt) {
+            const size_t n_bytes = ggml_nbytes(t);
+            col->stages[s].buf_alt.resize(n_bytes / sizeof(float));
+            ggml_backend_tensor_get(t, col->stages[s].buf_alt.data(), 0, n_bytes);
+            col->stages[s].has_alt = true;
+        } else if (name == expected_main) {
+            const size_t n_bytes = ggml_nbytes(t);
+            col->stages[s].buf_main.resize(n_bytes / sizeof(float));
+            ggml_backend_tensor_get(t, col->stages[s].buf_main.data(), 0, n_bytes);
+            col->stages[s].has_main = true;
+            col->stages[s].n_tokens_curr = t->ne[1];
+        } else if (name == expected_target) {
+            const size_t n_bytes = ggml_nbytes(t);
+            col->stages[s].buf_target.resize(n_bytes / sizeof(float));
+            ggml_backend_tensor_get(t, col->stages[s].buf_target.data(), 0, n_bytes);
+            col->stages[s].has_target = true;
+        }
+
+        col->stages[s].check_and_flush(3840);
     }
-
-    // --- STAGE 2 (Layers 27-29) ---
-    if (std::strcmp(t->name, "alt2_incubated-28") == 0) {
-        const size_t n_bytes = ggml_nbytes(t);
-        col->s2.buf_alt.resize(n_bytes / sizeof(float));
-        ggml_backend_tensor_get(t, col->s2.buf_alt.data(), 0, n_bytes);
-        col->s2.has_alt = true;
-    } else if (std::strcmp(t->name, "l_out-31") == 0) {
-        const size_t n_bytes = ggml_nbytes(t);
-        col->s2.buf_target.resize(n_bytes / sizeof(float));
-        ggml_backend_tensor_get(t, col->s2.buf_target.data(), 0, n_bytes);
-        col->s2.has_target = true;
-    }
-
-    col->s1.check_and_flush(3840);
-    col->s2.check_and_flush(3840);
 
     return true;
 }
@@ -113,20 +102,39 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    cascade_collector collector;
-    collector.s1.out_file.open("latents_stage1.bin", std::ios::binary);
-    collector.s2.out_file.open("latents_stage2.bin", std::ios::binary);
+    std::string out_dir = "F:/AI/CascadeLearning/latents";
+    {
+        std::ofstream test(out_dir + "/.probe");
+        if (!test.good()) {
+            out_dir = ".";
+        } else {
+            test.close();
+            std::remove((out_dir + "/.probe").c_str());
+        }
+    }
 
-    if (!collector.s1.out_file.is_open() || !collector.s2.out_file.is_open()) {
-        LOG_ERR("Failed to open output files\n");
-        return 1;
+    cascade_collector collector;
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        std::string path = out_dir + "/latents_stage" + std::to_string(s + 1) + ".bin";
+        collector.stages[s].out_file.open(path, std::ios::binary);
+        if (!collector.stages[s].out_file.is_open()) {
+            LOG_ERR("Failed to open output file: %s\n", path.c_str());
+            return 1;
+        }
     }
 
     params.cb_eval           = latent_cb_eval;
     params.cb_eval_user_data = &collector;
     params.warmup            = false;
-    params.n_ubatch          = 2048;
-    params.n_batch           = 2048;
+    if (params.n_ctx == 0) {
+        params.n_ctx = 8192;
+    }
+    if (params.n_batch < params.n_ctx) {
+        params.n_batch = params.n_ctx;
+    }
+    if (params.n_ubatch < 2048) {
+        params.n_ubatch = 2048;
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -142,10 +150,10 @@ int main(int argc, char ** argv) {
 
     LOG_INF("\n%s\n", common_params_get_system_info(params).c_str());
 
-    std::string dataset_file = "rich_train_dataset.txt";
+    std::string dataset_file = "F:/AI/CascadeLearning/rich_train_dataset.txt";
     std::ifstream file(dataset_file);
     if (!file.is_open()) {
-        dataset_file = "F:/AI/PatchedLlama/rich_train_dataset.txt";
+        dataset_file = "rich_train_dataset.txt";
         file.open(dataset_file);
     }
     if (!file.is_open()) {
@@ -168,7 +176,8 @@ int main(int argc, char ** argv) {
         problems.push_back(content);
     }
 
-    LOG_INF("Loaded %zu items from %s. Extracting Cascade latents on GPU...\n", problems.size(), dataset_file.c_str());
+    LOG_INF("Loaded %zu items from %s. Extracting %zu Cascade stages on GPU...\n",
+            problems.size(), dataset_file.c_str(), llama_cascade_config::NUM_STAGES);
 
     auto * mem = llama_get_memory(ctx);
 
@@ -189,16 +198,22 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        LOG_INF("Extracted item %3zu/%3zu | tokens: %zu | Stage 1: %lld | Stage 2: %lld\n",
+        LOG_INF("Extracted item %3zu/%3zu | tokens: %zu | S1: %lld | S2: %lld | S3: %lld | S4: %lld | S5: %lld | S6: %lld | S7: %lld\n",
                 i + 1, problems.size(), tokens.size(),
-                (long long) collector.s1.total_tokens, (long long) collector.s2.total_tokens);
+                (long long) collector.stages[0].total_tokens,
+                (long long) collector.stages[1].total_tokens,
+                (long long) collector.stages[2].total_tokens,
+                (long long) collector.stages[3].total_tokens,
+                (long long) collector.stages[4].total_tokens,
+                (long long) collector.stages[5].total_tokens,
+                (long long) collector.stages[6].total_tokens);
     }
 
-    collector.s1.out_file.close();
-    collector.s2.out_file.close();
-
-    LOG_INF("Saved Stage 1 latents to latents_stage1.bin (%lld tokens)\n", (long long) collector.s1.total_tokens);
-    LOG_INF("Saved Stage 2 latents to latents_stage2.bin (%lld tokens)\n", (long long) collector.s2.total_tokens);
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        collector.stages[s].out_file.close();
+        LOG_INF("Saved Stage %zu latents to %s/latents_stage%zu.bin (%lld tokens)\n",
+                s + 1, out_dir.c_str(), s + 1, (long long) collector.stages[s].total_tokens);
+    }
 
     llama_backend_free();
     return 0;

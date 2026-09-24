@@ -609,6 +609,29 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// Pipelined Lookahead Thought Cascade
+struct llama_cascade_stage {
+    int32_t fork_layer  = 0;  // 0-based layer where thought fork is spawned
+    int32_t merge_layer = 0;  // 0-based layer where thought is fused into residual
+    bool is_active      = false; // true if trained weights were successfully loaded
+    struct ggml_tensor * w_merge   = nullptr; // Projection matrix (FP16: n_embd x n_embd)
+    struct ggml_tensor * gate_proj = nullptr; // Gating projection (FP16: n_embd x 1)
+};
+
+struct llama_cascade_config {
+    static constexpr size_t  NUM_STAGES        = 7;
+    static constexpr int32_t FORK_START_LAYER = 23; // L24 (0-based: 23)
+    static constexpr int32_t LOOKAHEAD_SPAN   = 2;  // 2 FFN incubation layers (fork + 2 = merge)
+    static constexpr float   SIN_SCALE        = 0.05f;
+
+    static constexpr int32_t get_fork_layer(size_t stage) {
+        return FORK_START_LAYER + static_cast<int32_t>(stage);
+    }
+    static constexpr int32_t get_merge_layer(size_t stage) {
+        return get_fork_layer(stage) + LOOKAHEAD_SPAN;
+    }
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -684,11 +707,9 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
-    struct ggml_tensor * w_merge_1   = nullptr;
-    struct ggml_tensor * gate_proj_1 = nullptr;
-    struct ggml_tensor * w_merge_2   = nullptr;
-    struct ggml_tensor * gate_proj_2 = nullptr;
-    ggml_backend_buffer_t adapter_buf = nullptr;
+    // Cascaded Latent Thoughts
+    llama_cascade_stage   cascade_stages[llama_cascade_config::NUM_STAGES] = {};
+    ggml_backend_buffer_t cascade_adapter_buf = nullptr;
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;

@@ -3472,10 +3472,10 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_set_param(model->cls_out,         param_filter, param_filter_ud);
     llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
     llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
-    llama_set_param(model->w_merge_1,       param_filter, param_filter_ud);
-    llama_set_param(model->gate_proj_1,     param_filter, param_filter_ud);
-    llama_set_param(model->w_merge_2,       param_filter, param_filter_ud);
-    llama_set_param(model->gate_proj_2,     param_filter, param_filter_ud);
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        llama_set_param(model->cascade_stages[s].w_merge,   param_filter, param_filter_ud);
+        llama_set_param(model->cascade_stages[s].gate_proj, param_filter, param_filter_ud);
+    }
 
     for (struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {

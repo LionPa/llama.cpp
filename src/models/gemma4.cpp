@@ -144,7 +144,7 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
 }
 
 void llama_model_gemma4::init_adapter_weights() {
-    if (w_merge_1 != nullptr || hparams.n_layer() <= 29) {
+    if (cascade_stages[0].w_merge != nullptr || hparams.n_layer() < 34) {
         return;
     }
 
@@ -154,69 +154,122 @@ void llama_model_gemma4::init_adapter_weights() {
     }
 
     auto * buft = ggml_backend_buffer_get_type(target_layer_tensor->buffer);
-    const size_t ctx_size = ggml_tensor_overhead() * 8;
+    const size_t ctx_size = ggml_tensor_overhead() * (llama_cascade_config::NUM_STAGES * 2 + 8);
     struct ggml_init_params p = { ctx_size, nullptr, true };
     struct ggml_context * actx = ggml_init(p);
 
     const int64_t n_embd = hparams.n_embd;
 
-    w_merge_1   = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, n_embd);
-    ggml_set_name(w_merge_1, "w_merge_1");
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        cascade_stages[s].fork_layer  = llama_cascade_config::get_fork_layer(s);
+        cascade_stages[s].merge_layer = llama_cascade_config::get_merge_layer(s);
+        cascade_stages[s].is_active   = false;
 
-    gate_proj_1 = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, 1);
-    ggml_set_name(gate_proj_1, "gate_proj_1");
+        cascade_stages[s].w_merge   = ggml_new_tensor_2d(actx, GGML_TYPE_F16, n_embd, n_embd);
+        ggml_set_name(cascade_stages[s].w_merge, ("w_merge_" + std::to_string(s + 1)).c_str());
 
-    w_merge_2   = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, n_embd);
-    ggml_set_name(w_merge_2, "w_merge_2");
+        cascade_stages[s].gate_proj = ggml_new_tensor_2d(actx, GGML_TYPE_F16, n_embd, 1);
+        ggml_set_name(cascade_stages[s].gate_proj, ("gate_proj_" + std::to_string(s + 1)).c_str());
+    }
 
-    gate_proj_2 = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, 1);
-    ggml_set_name(gate_proj_2, "gate_proj_2");
+    cascade_adapter_buf = ggml_backend_alloc_ctx_tensors_from_buft(actx, buft);
+    if (!cascade_adapter_buf) {
+        fprintf(stderr, "[Cascade Adapter] Failed to allocate backend buffer for adapter tensors\n");
+        return;
+    }
 
-    adapter_buf = ggml_backend_alloc_ctx_tensors_from_buft(actx, buft);
-    if (adapter_buf) {
-        std::vector<uint8_t> zeros_w(ggml_nbytes(w_merge_1), 0);
-        std::vector<uint8_t> zeros_g(ggml_nbytes(gate_proj_1), 0);
+    // Zero-initialize all adapter tensors
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        std::vector<uint8_t> zeros_w(ggml_nbytes(cascade_stages[s].w_merge), 0);
+        std::vector<uint8_t> zeros_g(ggml_nbytes(cascade_stages[s].gate_proj), 0);
+        ggml_backend_tensor_set(cascade_stages[s].w_merge, zeros_w.data(), 0, zeros_w.size());
+        ggml_backend_tensor_set(cascade_stages[s].gate_proj, zeros_g.data(), 0, zeros_g.size());
+    }
 
-        ggml_backend_tensor_set(w_merge_1, zeros_w.data(), 0, zeros_w.size());
-        ggml_backend_tensor_set(gate_proj_1, zeros_g.data(), 0, zeros_g.size());
-        ggml_backend_tensor_set(w_merge_2, zeros_w.data(), 0, zeros_w.size());
-        ggml_backend_tensor_set(gate_proj_2, zeros_g.data(), 0, zeros_g.size());
-
-        // Stage 1 (Layers 24-26)
-        std::ifstream fw1("w_merge_1.bin", std::ios::binary);
-        if (fw1.is_open()) {
-            std::vector<char> data(ggml_nbytes(w_merge_1));
-            fw1.read(data.data(), data.size());
-            ggml_backend_tensor_set(w_merge_1, data.data(), 0, data.size());
-            fprintf(stderr, "\n\033[1;32m[Cascade Latent Adapter]\033[0m Stage 1 (L24-L26) loaded w_merge_1.bin (%.2f MB)\n", data.size() / (1024.0 * 1024.0));
-            fflush(stderr);
+    auto find_weight_file = [](const std::string & fname) -> std::string {
+        std::vector<std::string> search_dirs;
+        const char * env_dir = std::getenv("LLAMA_CASCADE_DIR");
+        if (env_dir && env_dir[0] != '\0') {
+            search_dirs.emplace_back(env_dir);
         }
-        std::ifstream fg1("gate_1.bin", std::ios::binary);
-        if (fg1.is_open()) {
-            std::vector<char> data(ggml_nbytes(gate_proj_1));
-            fg1.read(data.data(), data.size());
-            ggml_backend_tensor_set(gate_proj_1, data.data(), 0, data.size());
-            fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage 1 gate_1.bin (%.2f KB) active\n", data.size() / 1024.0);
-            fflush(stderr);
+        search_dirs.emplace_back("F:/AI/CascadeLearning/weights");
+        search_dirs.emplace_back("F:\\AI\\CascadeLearning\\weights");
+        search_dirs.emplace_back(".");
+
+        for (const auto & dir : search_dirs) {
+            std::string full_path = dir.empty() ? fname : (dir + "/" + fname);
+            std::ifstream f(full_path, std::ios::binary);
+            if (f.good()) {
+                return full_path;
+            }
+        }
+        return "";
+    };
+
+    size_t loaded_count = 0;
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        const std::string w_fname = "w_merge_" + std::to_string(s + 1) + ".bin";
+        const std::string g_fname = "gate_" + std::to_string(s + 1) + ".bin";
+
+        const std::string w_path = find_weight_file(w_fname);
+        const std::string g_path = find_weight_file(g_fname);
+
+        if (!w_path.empty()) {
+            std::ifstream fw(w_path, std::ios::binary);
+            if (fw.is_open()) {
+                fw.seekg(0, std::ios::end);
+                const size_t file_size = (size_t) fw.tellg();
+                fw.seekg(0, std::ios::beg);
+
+                const size_t exp_size = ggml_nbytes(cascade_stages[s].w_merge);
+                if (file_size != exp_size) {
+                    fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
+                        w_path.c_str(), exp_size, file_size);
+                } else {
+                    std::vector<char> data(exp_size);
+                    fw.read(data.data(), exp_size);
+                    if (fw.gcount() == static_cast<std::streamsize>(exp_size)) {
+                        ggml_backend_tensor_set(cascade_stages[s].w_merge, data.data(), 0, exp_size);
+                        cascade_stages[s].is_active = true;
+                        loaded_count++;
+                        fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu (L%d->L%d) loaded %s (%.2f MB, FP16)\n",
+                            s + 1, cascade_stages[s].fork_layer + 1, cascade_stages[s].merge_layer + 1,
+                            w_fname.c_str(), exp_size / (1024.0 * 1024.0));
+                        fflush(stderr);
+                    }
+                }
+            }
         }
 
-        // Stage 2 (Layers 27-29)
-        std::ifstream fw2("w_merge_2.bin", std::ios::binary);
-        if (fw2.is_open()) {
-            std::vector<char> data(ggml_nbytes(w_merge_2));
-            fw2.read(data.data(), data.size());
-            ggml_backend_tensor_set(w_merge_2, data.data(), 0, data.size());
-            fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage 2 (L27-L29) loaded w_merge_2.bin (%.2f MB)\n", data.size() / (1024.0 * 1024.0));
-            fflush(stderr);
+        if (!g_path.empty()) {
+            std::ifstream fg(g_path, std::ios::binary);
+            if (fg.is_open()) {
+                fg.seekg(0, std::ios::end);
+                const size_t file_size = (size_t) fg.tellg();
+                fg.seekg(0, std::ios::beg);
+
+                const size_t exp_size = ggml_nbytes(cascade_stages[s].gate_proj);
+                if (file_size != exp_size) {
+                    fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
+                        g_path.c_str(), exp_size, file_size);
+                } else {
+                    std::vector<char> data(exp_size);
+                    fg.read(data.data(), exp_size);
+                    if (fg.gcount() == static_cast<std::streamsize>(exp_size)) {
+                        ggml_backend_tensor_set(cascade_stages[s].gate_proj, data.data(), 0, exp_size);
+                        fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu gate active (%.2f KB, FP16)\n",
+                            s + 1, exp_size / 1024.0);
+                        fflush(stderr);
+                    }
+                }
+            }
         }
-        std::ifstream fg2("gate_2.bin", std::ios::binary);
-        if (fg2.is_open()) {
-            std::vector<char> data(ggml_nbytes(gate_proj_2));
-            fg2.read(data.data(), data.size());
-            ggml_backend_tensor_set(gate_proj_2, data.data(), 0, data.size());
-            fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage 2 gate_2.bin (%.2f KB) active\n\n", data.size() / 1024.0);
-            fflush(stderr);
-        }
+    }
+
+    if (loaded_count > 0) {
+        fprintf(stderr, "\033[1;36m[Cascade Latent Adapter]\033[0m Successfully activated %zu/%zu lookahead stages\n\n",
+            loaded_count, llama_cascade_config::NUM_STAGES);
+        fflush(stderr);
     }
 }
 
@@ -262,8 +315,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
-    ggml_tensor * alt1 = nullptr;
-    ggml_tensor * alt2 = nullptr;
+    ggml_tensor * alt_streams[llama_cascade_config::NUM_STAGES] = { nullptr };
+    const bool is_extracting = (cparams.cb_eval != nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
@@ -481,61 +534,51 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // --- STAGE 1 (Layers 24-26, indices 23-25) ---
-        if (il == 23) {
-            alt1 = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), 0.05f));
-            cb(alt1, "fork_alt1", il);
-        } else if (il == 24 || il == 25) {
-            if (alt1) {
-                ggml_tensor * norm1 = build_norm(alt1, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
-                ggml_tensor * ffn1  = build_ffn(norm1,
+        // --- Pipelined Lookahead Thought Cascade (7 Stages: L24..L30 -> L26..L32) ---
+        // 1. Incubation: pass active streams through layer il's FFN
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            const int32_t fork_l  = llama_cascade_config::get_fork_layer(s);
+            const int32_t merge_l = llama_cascade_config::get_merge_layer(s);
+
+            if (alt_streams[s] && il > fork_l && il <= merge_l) {
+                ggml_tensor * norm = build_norm(alt_streams[s], model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * ffn  = build_ffn(norm,
                         model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
                         model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                         model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                         nullptr, LLM_FFN_GELU, LLM_FFN_PAR, il);
-                ffn1 = build_norm(ffn1, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
-                alt1 = ggml_add(ctx0, alt1, ffn1);
-                cb(alt1, "alt1_incubated", il);
+                ffn = build_norm(ffn, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
+                alt_streams[s] = ggml_add(ctx0, alt_streams[s], ffn);
+                cb(alt_streams[s], ("alt_incubated_" + std::to_string(s + 1)).c_str(), il);
             }
         }
 
-        if (il == 25 && alt1 && model.w_merge_1) {
-            ggml_tensor * alt1_proj = ggml_mul_mat(ctx0, model.w_merge_1, alt1);
-            if (model.gate_proj_1) {
-                ggml_tensor * gate1 = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, model.gate_proj_1, alt1));
-                alt1_proj = ggml_mul(ctx0, alt1_proj, gate1);
-            }
-            cur = ggml_add(ctx0, cur, alt1_proj);
-            cb(cur, "fused_out_1", il);
-        }
+        // 2. Fusion: merge thoughts that have reached their target layer
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            const int32_t merge_l = llama_cascade_config::get_merge_layer(s);
+            const auto & stage = model.cascade_stages[s];
 
-        // --- STAGE 2 (Layers 27-29, indices 26-28) ---
-        if (il == 26) {
-            // Stage 2 starts from 'cur', which already contains the Stage 1 fused lookahead thought!
-            alt2 = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), 0.05f));
-            cb(alt2, "fork_alt2", il);
-        } else if (il == 27 || il == 28) {
-            if (alt2) {
-                ggml_tensor * norm2 = build_norm(alt2, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
-                ggml_tensor * ffn2  = build_ffn(norm2,
-                        model.layers[il].ffn_up,   nullptr, model.layers[il].ffn_up_s,
-                        model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
-                        model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
-                        nullptr, LLM_FFN_GELU, LLM_FFN_PAR, il);
-                ffn2 = build_norm(ffn2, model.layers[il].ffn_post_norm, nullptr, LLM_NORM_RMS, -1);
-                alt2 = ggml_add(ctx0, alt2, ffn2);
-                cb(alt2, "alt2_incubated", il);
+            // Fusion ONLY happens during normal generation with trained weights, NEVER during extraction
+            if (!is_extracting && il == merge_l && alt_streams[s] && stage.is_active && stage.w_merge) {
+                // w_merge is FP16, alt_streams[s] is FP32 -> accelerated on Tensor Cores!
+                ggml_tensor * alt_proj = ggml_mul_mat(ctx0, stage.w_merge, alt_streams[s]);
+                if (stage.gate_proj) {
+                    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, stage.gate_proj, alt_streams[s]));
+                    alt_proj = ggml_mul(ctx0, alt_proj, gate);
+                }
+                cur = ggml_add(ctx0, cur, alt_proj);
+                cb(cur, ("cascade_fused_" + std::to_string(s + 1)).c_str(), il);
             }
         }
 
-        if (il == 28 && alt2 && model.w_merge_2) {
-            ggml_tensor * alt2_proj = ggml_mul_mat(ctx0, model.w_merge_2, alt2);
-            if (model.gate_proj_2) {
-                ggml_tensor * gate2 = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, model.gate_proj_2, alt2));
-                alt2_proj = ggml_mul(ctx0, alt2_proj, gate2);
+        // 3. Fork: spawn new thought stream from current (already fused) representation
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            const int32_t fork_l = llama_cascade_config::get_fork_layer(s);
+            const auto & stage = model.cascade_stages[s];
+            if (il == fork_l && (stage.is_active || is_extracting)) {
+                alt_streams[s] = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), llama_cascade_config::SIN_SCALE));
+                cb(alt_streams[s], ("cascade_fork_" + std::to_string(s + 1)).c_str(), il);
             }
-            cur = ggml_add(ctx0, cur, alt2_proj);
-            cb(cur, "fused_out_2", il);
         }
 
         // input for next layer
@@ -574,6 +617,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    if (is_extracting) {
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            if (alt_streams[s]) {
+                ggml_build_forward_expand(gf, alt_streams[s]);
+            }
+        }
+    }
 }
 
 // equivalent to get_per_layer_inputs() in python code

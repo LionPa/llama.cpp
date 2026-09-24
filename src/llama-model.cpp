@@ -1221,8 +1221,9 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
-    if (adapter_buf) {
-        ggml_backend_buffer_free(adapter_buf);
+    if (cascade_adapter_buf) {
+        ggml_backend_buffer_free(cascade_adapter_buf);
+        cascade_adapter_buf = nullptr;
     }
 }
 
