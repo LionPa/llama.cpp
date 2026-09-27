@@ -866,9 +866,9 @@ struct llama_model_gemma4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    void init_adapter_weights();
+    void init_adapter_weights(const char * dir_path = nullptr);
     void init_extra_weights() override {
-        init_adapter_weights();
+        init_adapter_weights(params.cascade_dir);
     }
 
     struct graph : public llm_graph_context {
@@ -2342,6 +2342,11 @@ struct llama_model_qwen35 : public llama_model_base {
     llama_model_qwen35(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    void init_adapter_weights(const char * dir_path = nullptr);
+    void init_extra_weights() override {
+        init_adapter_weights(params.cascade_dir);
+    }
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

@@ -143,8 +143,24 @@ void llama_model_gemma4::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-void llama_model_gemma4::init_adapter_weights() {
+void llama_model_gemma4::init_adapter_weights(const char * dir_path) {
     if (cascade_stages[0].w_merge != nullptr || hparams.n_layer() < 34) {
+        return;
+    }
+
+    std::string path_dir;
+    if (dir_path && dir_path[0] != '\0') {
+        path_dir = dir_path;
+    } else if (params.cascade_dir && params.cascade_dir[0] != '\0') {
+        path_dir = params.cascade_dir;
+    } else {
+        const char * env_dir = std::getenv("LLAMA_CASCADE_DIR");
+        if (env_dir && env_dir[0] != '\0') {
+            path_dir = env_dir;
+        }
+    }
+
+    if (path_dir.empty()) {
         return;
     }
 
@@ -161,8 +177,8 @@ void llama_model_gemma4::init_adapter_weights() {
     const int64_t n_embd = hparams.n_embd;
 
     for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
-        cascade_stages[s].fork_layer  = llama_cascade_config::get_fork_layer(s);
-        cascade_stages[s].merge_layer = llama_cascade_config::get_merge_layer(s);
+        cascade_stages[s].fork_layer  = llama_cascade_config::get_fork_layer(s, hparams.n_layer());
+        cascade_stages[s].merge_layer = llama_cascade_config::get_merge_layer(s, hparams.n_layer());
         cascade_stages[s].is_active   = false;
 
         cascade_stages[s].w_merge   = ggml_new_tensor_2d(actx, GGML_TYPE_F16, n_embd, n_embd);
@@ -178,7 +194,6 @@ void llama_model_gemma4::init_adapter_weights() {
         return;
     }
 
-    // Zero-initialize all adapter tensors
     for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
         std::vector<uint8_t> zeros_w(ggml_nbytes(cascade_stages[s].w_merge), 0);
         std::vector<uint8_t> zeros_g(ggml_nbytes(cascade_stages[s].gate_proj), 0);
@@ -186,82 +201,62 @@ void llama_model_gemma4::init_adapter_weights() {
         ggml_backend_tensor_set(cascade_stages[s].gate_proj, zeros_g.data(), 0, zeros_g.size());
     }
 
-    auto find_weight_file = [](const std::string & fname) -> std::string {
-        std::vector<std::string> search_dirs;
-        const char * env_dir = std::getenv("LLAMA_CASCADE_DIR");
-        if (env_dir && env_dir[0] != '\0') {
-            search_dirs.emplace_back(env_dir);
-        }
-        search_dirs.emplace_back("F:/AI/CascadeLearning/weights");
-        search_dirs.emplace_back("F:\\AI\\CascadeLearning\\weights");
-        search_dirs.emplace_back(".");
-
-        for (const auto & dir : search_dirs) {
-            std::string full_path = dir.empty() ? fname : (dir + "/" + fname);
-            std::ifstream f(full_path, std::ios::binary);
-            if (f.good()) {
-                return full_path;
-            }
-        }
-        return "";
-    };
-
     size_t loaded_count = 0;
     for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
         const std::string w_fname = "w_merge_" + std::to_string(s + 1) + ".bin";
-        const std::string g_fname = "gate_" + std::to_string(s + 1) + ".bin";
-
-        const std::string w_path = find_weight_file(w_fname);
-        const std::string g_path = find_weight_file(g_fname);
-
-        if (!w_path.empty()) {
-            std::ifstream fw(w_path, std::ios::binary);
-            if (fw.is_open()) {
-                fw.seekg(0, std::ios::end);
-                const size_t file_size = (size_t) fw.tellg();
-                fw.seekg(0, std::ios::beg);
-
-                const size_t exp_size = ggml_nbytes(cascade_stages[s].w_merge);
-                if (file_size != exp_size) {
-                    fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
-                        w_path.c_str(), exp_size, file_size);
-                } else {
-                    std::vector<char> data(exp_size);
-                    fw.read(data.data(), exp_size);
-                    if (fw.gcount() == static_cast<std::streamsize>(exp_size)) {
-                        ggml_backend_tensor_set(cascade_stages[s].w_merge, data.data(), 0, exp_size);
-                        cascade_stages[s].is_active = true;
-                        loaded_count++;
-                        fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu (L%d->L%d) loaded %s (%.2f MB, FP16)\n",
-                            s + 1, cascade_stages[s].fork_layer + 1, cascade_stages[s].merge_layer + 1,
-                            w_fname.c_str(), exp_size / (1024.0 * 1024.0));
-                        fflush(stderr);
-                    }
-                }
+        std::string w_path = path_dir + "/" + w_fname;
+        std::string g_path = path_dir + "/gate_proj_" + std::to_string(s + 1) + ".bin";
+        {
+            std::ifstream fg_test(g_path, std::ios::binary);
+            if (!fg_test.good()) {
+                g_path = path_dir + "/gate_" + std::to_string(s + 1) + ".bin";
             }
         }
 
-        if (!g_path.empty()) {
-            std::ifstream fg(g_path, std::ios::binary);
-            if (fg.is_open()) {
-                fg.seekg(0, std::ios::end);
-                const size_t file_size = (size_t) fg.tellg();
-                fg.seekg(0, std::ios::beg);
+        std::ifstream fw(w_path, std::ios::binary);
+        if (fw.is_open()) {
+            fw.seekg(0, std::ios::end);
+            const size_t file_size = (size_t) fw.tellg();
+            fw.seekg(0, std::ios::beg);
 
-                const size_t exp_size = ggml_nbytes(cascade_stages[s].gate_proj);
-                if (file_size != exp_size) {
-                    fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
-                        g_path.c_str(), exp_size, file_size);
-                } else {
-                    std::vector<char> data(exp_size);
-                    fg.read(data.data(), exp_size);
-                    if (fg.gcount() == static_cast<std::streamsize>(exp_size)) {
-                        ggml_backend_tensor_set(cascade_stages[s].gate_proj, data.data(), 0, exp_size);
-                        fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu gate active (%.2f KB, FP16)\n",
-                            s + 1, exp_size / 1024.0);
-                        fflush(stderr);
-                    }
+            const size_t exp_size = ggml_nbytes(cascade_stages[s].w_merge);
+            if (file_size == exp_size) {
+                std::vector<char> data(exp_size);
+                fw.read(data.data(), exp_size);
+                if (fw.gcount() == static_cast<std::streamsize>(exp_size)) {
+                    ggml_backend_tensor_set(cascade_stages[s].w_merge, data.data(), 0, exp_size);
+                    cascade_stages[s].is_active = true;
+                    loaded_count++;
+                    fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu (L%d->L%d) loaded %s (%.2f MB, FP16)\n",
+                        s + 1, cascade_stages[s].fork_layer + 1, cascade_stages[s].merge_layer + 1,
+                        w_fname.c_str(), exp_size / (1024.0 * 1024.0));
+                    fflush(stderr);
                 }
+            } else {
+                fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
+                    w_path.c_str(), exp_size, file_size);
+            }
+        }
+
+        std::ifstream fg(g_path, std::ios::binary);
+        if (fg.is_open()) {
+            fg.seekg(0, std::ios::end);
+            const size_t file_size = (size_t) fg.tellg();
+            fg.seekg(0, std::ios::beg);
+
+            const size_t exp_size = ggml_nbytes(cascade_stages[s].gate_proj);
+            if (file_size == exp_size) {
+                std::vector<char> data(exp_size);
+                fg.read(data.data(), exp_size);
+                if (fg.gcount() == static_cast<std::streamsize>(exp_size)) {
+                    ggml_backend_tensor_set(cascade_stages[s].gate_proj, data.data(), 0, exp_size);
+                    fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu gate active (%.2f KB, FP16)\n",
+                        s + 1, exp_size / 1024.0);
+                    fflush(stderr);
+                }
+            } else {
+                fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
+                    g_path.c_str(), exp_size, file_size);
             }
         }
     }
@@ -274,7 +269,7 @@ void llama_model_gemma4::init_adapter_weights() {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_gemma4::build_arch_graph(const llm_graph_params & params) const {
-    const_cast<llama_model_gemma4 *>(this)->init_adapter_weights();
+    const_cast<llama_model_gemma4 *>(this)->init_adapter_weights(this->params.cascade_dir);
     return std::make_unique<graph>(*this, params);
 }
 

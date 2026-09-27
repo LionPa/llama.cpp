@@ -4733,10 +4733,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    add_opt(common_arg(
+        {"--cascade-dir"}, "PATH",
+        "path to cascade thought adapter weights directory",
+        [](common_params & params, const std::string & value) {
+            params.cascade_dir = value;
+        }
+    ));
+
     return ctx_arg;
 }
 
 void common_params_add_preset_options(std::vector<common_arg> & args) {
+
     // arguments below won't be treated as CLI args, only preset options
     args.push_back(common_arg(
         {"load-on-startup"}, "NAME",

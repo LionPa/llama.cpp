@@ -1,5 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "ggml-alloc.h"
+#include <fstream>
+#include <vector>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -123,7 +126,134 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+void llama_model_qwen35::init_adapter_weights(const char * dir_path) {
+    if (cascade_stages[0].w_merge != nullptr || hparams.n_layer() < 34) {
+        return;
+    }
+
+    std::string path_dir;
+    if (dir_path && dir_path[0] != '\0') {
+        path_dir = dir_path;
+    } else if (params.cascade_dir && params.cascade_dir[0] != '\0') {
+        path_dir = params.cascade_dir;
+    } else {
+        const char * env_dir = std::getenv("LLAMA_CASCADE_DIR");
+        if (env_dir && env_dir[0] != '\0') {
+            path_dir = env_dir;
+        }
+    }
+
+    if (path_dir.empty()) {
+        return;
+    }
+
+    const int target_layer_idx = std::min((int)hparams.n_layer() - 1, 40);
+    auto * target_layer_tensor = layers[target_layer_idx].ffn_down;
+    if (!target_layer_tensor || !target_layer_tensor->buffer) {
+        return;
+    }
+
+    auto * buft = ggml_backend_buffer_get_type(target_layer_tensor->buffer);
+    const size_t ctx_size = ggml_tensor_overhead() * (llama_cascade_config::NUM_STAGES * 2 + 8);
+    struct ggml_init_params p = { ctx_size, nullptr, true };
+    struct ggml_context * actx = ggml_init(p);
+
+    const int64_t n_embd = hparams.n_embd;
+
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        cascade_stages[s].fork_layer  = llama_cascade_config::get_fork_layer(s, hparams.n_layer());
+        cascade_stages[s].merge_layer = llama_cascade_config::get_merge_layer(s, hparams.n_layer());
+        cascade_stages[s].is_active   = false;
+
+        cascade_stages[s].w_merge   = ggml_new_tensor_2d(actx, GGML_TYPE_F16, n_embd, n_embd);
+        ggml_set_name(cascade_stages[s].w_merge, ("w_merge_" + std::to_string(s + 1)).c_str());
+
+        cascade_stages[s].gate_proj = ggml_new_tensor_2d(actx, GGML_TYPE_F16, n_embd, 1);
+        ggml_set_name(cascade_stages[s].gate_proj, ("gate_proj_" + std::to_string(s + 1)).c_str());
+    }
+
+    cascade_adapter_buf = ggml_backend_alloc_ctx_tensors_from_buft(actx, buft);
+    if (!cascade_adapter_buf) {
+        fprintf(stderr, "[Cascade Adapter] Failed to allocate backend buffer for adapter tensors\n");
+        return;
+    }
+
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        std::vector<uint8_t> zeros_w(ggml_nbytes(cascade_stages[s].w_merge), 0);
+        std::vector<uint8_t> zeros_g(ggml_nbytes(cascade_stages[s].gate_proj), 0);
+        ggml_backend_tensor_set(cascade_stages[s].w_merge, zeros_w.data(), 0, zeros_w.size());
+        ggml_backend_tensor_set(cascade_stages[s].gate_proj, zeros_g.data(), 0, zeros_g.size());
+    }
+
+    size_t loaded_count = 0;
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        const std::string w_fname = "w_merge_" + std::to_string(s + 1) + ".bin";
+        std::string w_path = path_dir + "/" + w_fname;
+        std::string g_path = path_dir + "/gate_proj_" + std::to_string(s + 1) + ".bin";
+        {
+            std::ifstream fg_test(g_path, std::ios::binary);
+            if (!fg_test.good()) {
+                g_path = path_dir + "/gate_" + std::to_string(s + 1) + ".bin";
+            }
+        }
+
+        std::ifstream fw(w_path, std::ios::binary);
+        if (fw.is_open()) {
+            fw.seekg(0, std::ios::end);
+            const size_t file_size = (size_t) fw.tellg();
+            fw.seekg(0, std::ios::beg);
+
+            const size_t exp_size = ggml_nbytes(cascade_stages[s].w_merge);
+            if (file_size == exp_size) {
+                std::vector<char> data(exp_size);
+                fw.read(data.data(), exp_size);
+                if (fw.gcount() == static_cast<std::streamsize>(exp_size)) {
+                    ggml_backend_tensor_set(cascade_stages[s].w_merge, data.data(), 0, exp_size);
+                    cascade_stages[s].is_active = true;
+                    loaded_count++;
+                    fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu (L%d->L%d) loaded %s (%.2f MB, FP16)\n",
+                        s + 1, cascade_stages[s].fork_layer + 1, cascade_stages[s].merge_layer + 1,
+                        w_fname.c_str(), exp_size / (1024.0 * 1024.0));
+                    fflush(stderr);
+                }
+            } else {
+                fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
+                    w_path.c_str(), exp_size, file_size);
+            }
+        }
+
+        std::ifstream fg(g_path, std::ios::binary);
+        if (fg.is_open()) {
+            fg.seekg(0, std::ios::end);
+            const size_t file_size = (size_t) fg.tellg();
+            fg.seekg(0, std::ios::beg);
+
+            const size_t exp_size = ggml_nbytes(cascade_stages[s].gate_proj);
+            if (file_size == exp_size) {
+                std::vector<char> data(exp_size);
+                fg.read(data.data(), exp_size);
+                if (fg.gcount() == static_cast<std::streamsize>(exp_size)) {
+                    ggml_backend_tensor_set(cascade_stages[s].gate_proj, data.data(), 0, exp_size);
+                    fprintf(stderr, "\033[1;32m[Cascade Latent Adapter]\033[0m Stage %zu gate active (%.2f KB, FP16)\n",
+                        s + 1, exp_size / 1024.0);
+                    fflush(stderr);
+                }
+            } else {
+                fprintf(stderr, "\033[1;33m[Cascade Adapter]\033[0m File %s size mismatch (expected %zu bytes, got %zu). Skipping.\n",
+                    g_path.c_str(), exp_size, file_size);
+            }
+        }
+    }
+
+    if (loaded_count > 0) {
+        fprintf(stderr, "\033[1;36m[Cascade Latent Adapter]\033[0m Successfully activated %zu/%zu lookahead stages\n\n",
+            loaded_count, llama_cascade_config::NUM_STAGES);
+        fflush(stderr);
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
+    const_cast<llama_model_qwen35 *>(this)->init_adapter_weights(this->params.cascade_dir);
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
@@ -151,7 +281,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+    ggml_tensor * alt_streams[llama_cascade_config::NUM_STAGES] = { nullptr };
+    const bool is_extracting = (cparams.cb_eval != nullptr);
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -162,12 +294,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         ggml_build_forward_expand(gf, cur);
 
-        // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
-            // Linear attention layer (gated delta net)
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
-            // Full attention layer
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
@@ -176,29 +305,59 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
-        // Residual connection
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
-        // Save the tensor before post-attention norm for residual connection
         ggml_tensor * ffn_residual = cur;
 
-        // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
-        // Dense FFN layer - without residual connection
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
 
-        // Residual connection for FFN - add to the tensor from before post_attention_layernorm
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "post_ffn", il);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // Input for next layer
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            const int32_t fork_l  = llama_cascade_config::get_fork_layer(s, n_layer);
+            const int32_t merge_l = llama_cascade_config::get_merge_layer(s, n_layer);
+
+            if (alt_streams[s] && il > fork_l && il <= merge_l) {
+                ggml_tensor * norm = build_norm(alt_streams[s], model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * ffn  = build_layer_ffn(norm, il);
+                alt_streams[s] = ggml_add(ctx0, alt_streams[s], ffn);
+                cb(alt_streams[s], ("alt_incubated_" + std::to_string(s + 1)).c_str(), il);
+            }
+        }
+
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            const int32_t merge_l = llama_cascade_config::get_merge_layer(s, n_layer);
+            const auto & stage = model.cascade_stages[s];
+
+            if (!is_extracting && il == merge_l && alt_streams[s] && stage.is_active && stage.w_merge) {
+                ggml_tensor * alt_proj = ggml_mul_mat(ctx0, stage.w_merge, alt_streams[s]);
+                if (stage.gate_proj) {
+                    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, stage.gate_proj, alt_streams[s]));
+                    alt_proj = ggml_mul(ctx0, alt_proj, gate);
+                }
+                cur = ggml_add(ctx0, cur, alt_proj);
+                cb(cur, ("cascade_fused_" + std::to_string(s + 1)).c_str(), il);
+            }
+        }
+
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            const int32_t fork_l = llama_cascade_config::get_fork_layer(s, n_layer);
+            const auto & stage = model.cascade_stages[s];
+            if (il == fork_l && (stage.is_active || is_extracting)) {
+                alt_streams[s] = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), llama_cascade_config::SIN_SCALE));
+                cb(alt_streams[s], ("cascade_fork_" + std::to_string(s + 1)).c_str(), il);
+            }
+        }
+
         inpL = cur;
     }
     cur = inpL;
@@ -215,13 +374,20 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    if (is_extracting) {
+        for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+            if (alt_streams[s]) {
+                ggml_build_forward_expand(gf, alt_streams[s]);
+            }
+        }
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(

@@ -610,26 +610,28 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
-// Pipelined Lookahead Thought Cascade
 struct llama_cascade_stage {
-    int32_t fork_layer  = 0;  // 0-based layer where thought fork is spawned
-    int32_t merge_layer = 0;  // 0-based layer where thought is fused into residual
-    bool is_active      = false; // true if trained weights were successfully loaded
-    struct ggml_tensor * w_merge   = nullptr; // Projection matrix (FP16: n_embd x n_embd)
-    struct ggml_tensor * gate_proj = nullptr; // Gating projection (FP16: n_embd x 1)
+    int32_t fork_layer  = 0;
+    int32_t merge_layer = 0;
+    bool is_active      = false;
+    struct ggml_tensor * w_merge   = nullptr;
+    struct ggml_tensor * gate_proj = nullptr;
 };
 
 struct llama_cascade_config {
     static constexpr size_t  NUM_STAGES        = 7;
-    static constexpr int32_t FORK_START_LAYER = 23; // L24 (0-based: 23)
-    static constexpr int32_t LOOKAHEAD_SPAN   = 2;  // 2 FFN incubation layers (fork + 2 = merge)
+    static constexpr int32_t FORK_START_LAYER = 23;
+    static constexpr int32_t LOOKAHEAD_SPAN   = 2;
     static constexpr float   SIN_SCALE        = 0.05f;
 
-    static constexpr int32_t get_fork_layer(size_t stage) {
-        return FORK_START_LAYER + static_cast<int32_t>(stage);
+    static constexpr int32_t get_fork_start(int32_t n_layer = 0) {
+        return (n_layer >= 60) ? 40 : FORK_START_LAYER;
     }
-    static constexpr int32_t get_merge_layer(size_t stage) {
-        return get_fork_layer(stage) + LOOKAHEAD_SPAN;
+    static constexpr int32_t get_fork_layer(size_t stage, int32_t n_layer = 0) {
+        return get_fork_start(n_layer) + static_cast<int32_t>(stage);
+    }
+    static constexpr int32_t get_merge_layer(size_t stage, int32_t n_layer = 0) {
+        return get_fork_layer(stage, n_layer) + LOOKAHEAD_SPAN;
     }
 };
 

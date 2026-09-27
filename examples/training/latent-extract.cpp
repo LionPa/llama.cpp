@@ -45,6 +45,7 @@ struct stage_collector {
 
 struct cascade_collector {
     stage_collector stages[llama_cascade_config::NUM_STAGES];
+    const llama_model * model = nullptr;
 };
 
 static bool latent_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -57,9 +58,11 @@ static bool latent_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     auto * col = (cascade_collector *) user_data;
     const std::string name(t->name);
+    const int32_t n_layer = col->model ? llama_model_n_layer(col->model) : 0;
+    const uint32_t dim    = col->model ? (uint32_t) llama_model_n_embd(col->model) : (uint32_t) t->ne[0];
 
     for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
-        const int32_t merge_l  = llama_cascade_config::get_merge_layer(s);
+        const int32_t merge_l  = llama_cascade_config::get_merge_layer(s, n_layer);
         const int32_t target_l = merge_l + 3;
 
         const std::string expected_alt    = "alt_incubated_" + std::to_string(s + 1) + "-" + std::to_string(merge_l);
@@ -84,7 +87,7 @@ static bool latent_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
             col->stages[s].has_target = true;
         }
 
-        col->stages[s].check_and_flush(3840);
+        col->stages[s].check_and_flush(dim);
     }
 
     return true;
@@ -147,6 +150,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("Failed to load model or context\n");
         return 1;
     }
+
+    collector.model = model;
 
     LOG_INF("\n%s\n", common_params_get_system_info(params).c_str());
 

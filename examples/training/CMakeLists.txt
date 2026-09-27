@@ -16,3 +16,11 @@ install(TARGETS ${TARGET_EXTRACTOR} RUNTIME)
 target_include_directories(${TARGET_EXTRACTOR} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_link_libraries(${TARGET_EXTRACTOR} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_EXTRACTOR} PRIVATE cxx_std_17)
+
+set(TARGET_CPT_TRAINER llama-cpt-trainer)
+add_executable(${TARGET_CPT_TRAINER} cpt-trainer.cpp)
+install(TARGETS ${TARGET_CPT_TRAINER} RUNTIME)
+target_include_directories(${TARGET_CPT_TRAINER} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+target_link_libraries(${TARGET_CPT_TRAINER} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET_CPT_TRAINER} PRIVATE cxx_std_17)
+
