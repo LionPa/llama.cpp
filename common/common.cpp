@@ -1665,6 +1665,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     mparams.cascade_dir                 = params.cascade_dir.empty() ? nullptr : params.cascade_dir.c_str();
+    mparams.cascade_sin                 = params.cascade_sin;
 
     return mparams;
 }

@@ -22,8 +22,8 @@
 #endif
 
 struct stage_data {
-    std::vector<float> x;
-    std::vector<float> y;
+    std::vector<ggml_fp16_t> x;
+    std::vector<ggml_fp16_t> y;
     int64_t total_tokens = 0;
 };
 
@@ -43,24 +43,37 @@ struct trainer_collector {
     const llama_model * model = nullptr;
     float gamma = 0.08f;
     uint32_t dim = 0;
+    int64_t max_tokens = 100000;
 
     void check_and_accumulate(size_t s) {
         if (stages[s].has_main && stages[s].has_alt && stages[s].has_target) {
-            const int64_t n_tok = stages[s].n_tokens_curr;
+            int64_t n_tok = stages[s].n_tokens_curr;
+            if (max_tokens > 0 && data[s].total_tokens + n_tok > max_tokens) {
+                n_tok = max_tokens - data[s].total_tokens;
+            }
+            if (n_tok <= 0) {
+                stages[s].has_main = false;
+                stages[s].has_alt = false;
+                stages[s].has_target = false;
+                return;
+            }
+
             const size_t total_floats = (size_t) n_tok * dim;
 
             const size_t cur_size = data[s].x.size();
             data[s].x.resize(cur_size + total_floats);
             data[s].y.resize(cur_size + total_floats);
 
-            std::memcpy(data[s].x.data() + cur_size, stages[s].buf_alt.data(), total_floats * sizeof(float));
+            const float * alt_ptr = stages[s].buf_alt.data();
+            const float * m_ptr   = stages[s].buf_main.data();
+            const float * t_ptr   = stages[s].buf_target.data();
 
-            const float * m_ptr = stages[s].buf_main.data();
-            const float * t_ptr = stages[s].buf_target.data();
-            float * y_dst = data[s].y.data() + cur_size;
+            ggml_fp16_t * x_dst = data[s].x.data() + cur_size;
+            ggml_fp16_t * y_dst = data[s].y.data() + cur_size;
 
             for (size_t i = 0; i < total_floats; ++i) {
-                y_dst[i] = (t_ptr[i] - m_ptr[i]) * gamma;
+                x_dst[i] = ggml_fp32_to_fp16(alt_ptr[i]);
+                y_dst[i] = ggml_fp32_to_fp16((t_ptr[i] - m_ptr[i]) * gamma);
             }
 
             data[s].total_tokens += n_tok;
@@ -153,9 +166,9 @@ static bool load_stage_data_from_file(const std::string & path, uint32_t dim, fl
         out.x.resize(cur_sz + chunk_floats);
         out.y.resize(cur_sz + chunk_floats);
 
-        std::memcpy(out.x.data() + cur_sz, buf_a.data(), chunk_bytes);
         for (size_t i = 0; i < chunk_floats; ++i) {
-            out.y[cur_sz + i] = (buf_t[i] - buf_m[i]) * gamma;
+            out.x[cur_sz + i] = ggml_fp32_to_fp16(buf_a[i]);
+            out.y[cur_sz + i] = ggml_fp32_to_fp16((buf_t[i] - buf_m[i]) * gamma);
         }
 
         out.total_tokens += n_tok;
@@ -230,8 +243,14 @@ static void train_single_stage(
 
             for (int i = 0; i < batch_size; ++i) {
                 const int64_t tok_idx = indices[b * batch_size + i];
-                std::memcpy(bx.data() + (size_t) i * dim, sdata.x.data() + (size_t) tok_idx * dim, dim * sizeof(float));
-                std::memcpy(by.data() + (size_t) i * dim, sdata.y.data() + (size_t) tok_idx * dim, dim * sizeof(float));
+                const ggml_fp16_t * src_x = sdata.x.data() + (size_t) tok_idx * dim;
+                const ggml_fp16_t * src_y = sdata.y.data() + (size_t) tok_idx * dim;
+                float * dst_x = bx.data() + (size_t) i * dim;
+                float * dst_y = by.data() + (size_t) i * dim;
+                for (uint32_t k = 0; k < dim; ++k) {
+                    dst_x[k] = ggml_fp16_to_fp32(src_x[k]);
+                    dst_y[k] = ggml_fp16_to_fp32(src_y[k]);
+                }
             }
 
             std::vector<float> dp((size_t) batch_size * dim);
@@ -422,6 +441,7 @@ int main(int argc, char ** argv) {
     float gamma = 0.08f;
     float grad_clip = 1.0f;
     int target_stage = 0;
+    int64_t max_tokens = 100000;
 
     std::vector<char *> clean_argv;
     clean_argv.push_back(argv[0]);
@@ -450,6 +470,8 @@ int main(int argc, char ** argv) {
             grad_clip = std::stof(argv[++i]);
         } else if (arg == "--stage" && i + 1 < argc) {
             target_stage = std::stoi(argv[++i]);
+        } else if (arg == "--max-tokens" && i + 1 < argc) {
+            max_tokens = std::stoll(argv[++i]);
         } else {
             clean_argv.push_back(argv[i]);
         }
@@ -461,6 +483,7 @@ int main(int argc, char ** argv) {
 
     trainer_collector collector;
     collector.gamma = gamma;
+    collector.max_tokens = max_tokens;
 
     bool have_files = false;
     uint32_t model_dim = 0;
@@ -538,24 +561,86 @@ int main(int argc, char ** argv) {
 
         std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         std::vector<std::string> problems;
-        std::string delimiter = "\n---\n";
-        size_t pos = 0;
-        while ((pos = content.find(delimiter)) != std::string::npos) {
-            std::string token = content.substr(0, pos);
-            if (!token.empty()) {
-                problems.push_back(token);
+
+        if (content.find("<|turn>user") != std::string::npos) {
+            const std::string tag = "<|turn>user";
+            size_t start = 0;
+            while ((start = content.find(tag, start)) != std::string::npos) {
+                size_t next = content.find(tag, start + tag.length());
+                std::string item = (next == std::string::npos) ?
+                    content.substr(start) : content.substr(start, next - start);
+                while (!item.empty() && (item.back() == '\r' || item.back() == '\n' || item.back() == ' ')) {
+                    item.pop_back();
+                }
+                if (!item.empty()) {
+                    problems.push_back(item);
+                }
+                if (next == std::string::npos) {
+                    break;
+                }
+                start = next;
             }
-            content.erase(0, pos + delimiter.length());
-        }
-        if (!content.empty()) {
-            problems.push_back(content);
+        } else if (content.find("<|im_start|>") != std::string::npos) {
+            const std::string tag = "<|im_start|>";
+            size_t start = 0;
+            while ((start = content.find(tag, start)) != std::string::npos) {
+                size_t next = content.find(tag, start + tag.length());
+                std::string item = (next == std::string::npos) ?
+                    content.substr(start) : content.substr(start, next - start);
+                while (!item.empty() && (item.back() == '\r' || item.back() == '\n' || item.back() == ' ')) {
+                    item.pop_back();
+                }
+                if (!item.empty()) {
+                    problems.push_back(item);
+                }
+                if (next == std::string::npos) {
+                    break;
+                }
+                start = next;
+            }
+        } else {
+            std::string delim = "\n---\n";
+            if (content.find(delim) == std::string::npos) {
+                delim = content.find("\r\n---\r\n") != std::string::npos ? "\r\n---\r\n" : "---";
+            }
+            size_t start = 0;
+            while (start < content.size()) {
+                size_t pos = content.find(delim, start);
+                std::string item = (pos == std::string::npos) ?
+                    content.substr(start) : content.substr(start, pos - start);
+                while (!item.empty() && (item.front() == '\r' || item.front() == '\n' || item.front() == ' ')) {
+                    item.erase(item.begin());
+                }
+                while (!item.empty() && (item.back() == '\r' || item.back() == '\n' || item.back() == ' ')) {
+                    item.pop_back();
+                }
+                if (!item.empty()) {
+                    problems.push_back(item);
+                }
+                if (pos == std::string::npos) {
+                    break;
+                }
+                start = pos + delim.length();
+            }
         }
 
         LOG_INF("Loaded %zu items from %s. Extracting into RAM on GPU...\n", problems.size(), dataset_file.c_str());
 
         auto * mem = llama_get_memory(ctx);
 
+        if (max_tokens > 0) {
+            for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+                collector.data[s].x.reserve((size_t) max_tokens * model_dim);
+                collector.data[s].y.reserve((size_t) max_tokens * model_dim);
+            }
+        }
+
         for (size_t i = 0; i < problems.size(); ++i) {
+            if (max_tokens > 0 && collector.data[0].total_tokens >= max_tokens) {
+                LOG_INF("\n>> Reached target limit of %lld tokens. Stopping extraction.\n", (long long) max_tokens);
+                break;
+            }
+
             llama_memory_clear(mem, true);
 
             std::vector<llama_token> tokens = common_tokenize(ctx, problems[i], true, true);
@@ -578,6 +663,7 @@ int main(int argc, char ** argv) {
                     (long long) collector.data[6].total_tokens);
         }
 
+        llama_init.reset();
         llama_backend_free();
     }
 

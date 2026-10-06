@@ -122,8 +122,8 @@ int main(int argc, char ** argv) {
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
 
-    save_tensor_to_binary(model->w_merge, "w_merge.bin");
-    save_tensor_to_binary(model->gate_proj, "gate.bin");
+    save_tensor_to_binary(model->cascade_stages[0].w_merge, "w_merge.bin");
+    save_tensor_to_binary(model->cascade_stages[0].gate_proj, "gate.bin");
 
     llama_backend_free();
 

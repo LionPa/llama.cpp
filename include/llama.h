@@ -355,6 +355,7 @@ extern "C" {
         bool load_mtp;        // whether to load MTP layers
 
         const char * cascade_dir;
+        float cascade_sin;
     };
 
     struct llama_sampler_seq_config {

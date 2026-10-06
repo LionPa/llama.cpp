@@ -816,6 +816,7 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+    const llama_model_params & get_params() const { return params; }
 
 protected:
     llama_model_params params;

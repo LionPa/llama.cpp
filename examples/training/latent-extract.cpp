@@ -3,11 +3,13 @@
 #include "log.h"
 #include "llama.h"
 #include "llama-model.h"
+#include "ggml.h"
 
 #include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -32,9 +34,25 @@ struct stage_collector {
             const uint32_t n_tok = (uint32_t) n_tokens_curr;
             out_file.write(reinterpret_cast<const char *>(&n_tok), sizeof(n_tok));
             out_file.write(reinterpret_cast<const char *>(&dim),   sizeof(dim));
-            out_file.write(reinterpret_cast<const char *>(buf_main.data()),   n_tok * dim * sizeof(float));
-            out_file.write(reinterpret_cast<const char *>(buf_alt.data()),    n_tok * dim * sizeof(float));
-            out_file.write(reinterpret_cast<const char *>(buf_target.data()), n_tok * dim * sizeof(float));
+
+            const size_t total = (size_t) n_tok * dim;
+            std::vector<ggml_fp16_t> fp16_buf(total);
+
+            for (size_t i = 0; i < total; ++i) {
+                fp16_buf[i] = ggml_fp32_to_fp16(buf_main[i]);
+            }
+            out_file.write(reinterpret_cast<const char *>(fp16_buf.data()), total * sizeof(ggml_fp16_t));
+
+            for (size_t i = 0; i < total; ++i) {
+                fp16_buf[i] = ggml_fp32_to_fp16(buf_alt[i]);
+            }
+            out_file.write(reinterpret_cast<const char *>(fp16_buf.data()), total * sizeof(ggml_fp16_t));
+
+            for (size_t i = 0; i < total; ++i) {
+                fp16_buf[i] = ggml_fp32_to_fp16(buf_target[i]);
+            }
+            out_file.write(reinterpret_cast<const char *>(fp16_buf.data()), total * sizeof(ggml_fp16_t));
+
             total_tokens += n_tok;
             has_main   = false;
             has_alt    = false;
@@ -101,20 +119,31 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    std::string out_dir = "latents";
+    std::string dataset_file = "";
+    int64_t max_tokens = 100000;
+
+    std::vector<char *> clean_argv;
+    clean_argv.push_back(argv[0]);
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--out-dir" && i + 1 < argc) {
+            out_dir = argv[++i];
+        } else if (arg == "--dataset" && i + 1 < argc) {
+            dataset_file = argv[++i];
+        } else if (arg == "--max-tokens" && i + 1 < argc) {
+            max_tokens = std::stoll(argv[++i]);
+        } else {
+            clean_argv.push_back(argv[i]);
+        }
+    }
+
+    if (!common_params_parse((int) clean_argv.size(), clean_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
-    std::string out_dir = "F:/AI/CascadeLearning/latents";
-    {
-        std::ofstream test(out_dir + "/.probe");
-        if (!test.good()) {
-            out_dir = ".";
-        } else {
-            test.close();
-            std::remove((out_dir + "/.probe").c_str());
-        }
-    }
+    std::filesystem::create_directories(out_dir);
 
     cascade_collector collector;
     for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
@@ -155,12 +184,12 @@ int main(int argc, char ** argv) {
 
     LOG_INF("\n%s\n", common_params_get_system_info(params).c_str());
 
-    std::string dataset_file = "F:/AI/CascadeLearning/rich_train_dataset.txt";
-    std::ifstream file(dataset_file);
-    if (!file.is_open()) {
-        dataset_file = "rich_train_dataset.txt";
-        file.open(dataset_file);
+    if (dataset_file.empty()) {
+        LOG_ERR("Dataset file not specified. Use --dataset <path>\n");
+        return 1;
     }
+
+    std::ifstream file(dataset_file);
     if (!file.is_open()) {
         LOG_ERR("Failed to open dataset file: %s\n", dataset_file.c_str());
         return 1;
@@ -168,17 +197,67 @@ int main(int argc, char ** argv) {
 
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     std::vector<std::string> problems;
-    std::string delimiter = "\n---\n";
-    size_t pos = 0;
-    while ((pos = content.find(delimiter)) != std::string::npos) {
-        std::string token = content.substr(0, pos);
-        if (!token.empty()) {
-            problems.push_back(token);
+
+    if (content.find("<|turn>user") != std::string::npos) {
+        const std::string tag = "<|turn>user";
+        size_t start = 0;
+        while ((start = content.find(tag, start)) != std::string::npos) {
+            size_t next = content.find(tag, start + tag.length());
+            std::string item = (next == std::string::npos) ?
+                content.substr(start) : content.substr(start, next - start);
+            while (!item.empty() && (item.back() == '\r' || item.back() == '\n' || item.back() == ' ')) {
+                item.pop_back();
+            }
+            if (!item.empty()) {
+                problems.push_back(item);
+            }
+            if (next == std::string::npos) {
+                break;
+            }
+            start = next;
         }
-        content.erase(0, pos + delimiter.length());
-    }
-    if (!content.empty()) {
-        problems.push_back(content);
+    } else if (content.find("<|im_start|>") != std::string::npos) {
+        const std::string tag = "<|im_start|>";
+        size_t start = 0;
+        while ((start = content.find(tag, start)) != std::string::npos) {
+            size_t next = content.find(tag, start + tag.length());
+            std::string item = (next == std::string::npos) ?
+                content.substr(start) : content.substr(start, next - start);
+            while (!item.empty() && (item.back() == '\r' || item.back() == '\n' || item.back() == ' ')) {
+                item.pop_back();
+            }
+            if (!item.empty()) {
+                problems.push_back(item);
+            }
+            if (next == std::string::npos) {
+                break;
+            }
+            start = next;
+        }
+    } else {
+        std::string delim = "\n---\n";
+        if (content.find(delim) == std::string::npos) {
+            delim = content.find("\r\n---\r\n") != std::string::npos ? "\r\n---\r\n" : "---";
+        }
+        size_t start = 0;
+        while (start < content.size()) {
+            size_t pos = content.find(delim, start);
+            std::string item = (pos == std::string::npos) ?
+                content.substr(start) : content.substr(start, pos - start);
+            while (!item.empty() && (item.front() == '\r' || item.front() == '\n' || item.front() == ' ')) {
+                item.erase(item.begin());
+            }
+            while (!item.empty() && (item.back() == '\r' || item.back() == '\n' || item.back() == ' ')) {
+                item.pop_back();
+            }
+            if (!item.empty()) {
+                problems.push_back(item);
+            }
+            if (pos == std::string::npos) {
+                break;
+            }
+            start = pos + delim.length();
+        }
     }
 
     LOG_INF("Loaded %zu items from %s. Extracting %zu Cascade stages on GPU...\n",
@@ -187,6 +266,11 @@ int main(int argc, char ** argv) {
     auto * mem = llama_get_memory(ctx);
 
     for (size_t i = 0; i < problems.size(); ++i) {
+        if (max_tokens > 0 && collector.stages[0].total_tokens >= max_tokens) {
+            LOG_INF("\n>> Reached target limit of %lld tokens. Stopping extraction.\n", (long long) max_tokens);
+            break;
+        }
+
         llama_memory_clear(mem, true);
 
         std::vector<llama_token> tokens = common_tokenize(ctx, problems[i], true, true);
@@ -203,14 +287,9 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        LOG_INF("Extracted item %3zu/%3zu | tokens: %zu | S1: %lld | S2: %lld | S3: %lld | S4: %lld | S5: %lld | S6: %lld | S7: %lld\n",
+        LOG_INF("Extracted item %3zu/%3zu | tokens: %zu | S1: %lld | S7: %lld\n",
                 i + 1, problems.size(), tokens.size(),
                 (long long) collector.stages[0].total_tokens,
-                (long long) collector.stages[1].total_tokens,
-                (long long) collector.stages[2].total_tokens,
-                (long long) collector.stages[3].total_tokens,
-                (long long) collector.stages[4].total_tokens,
-                (long long) collector.stages[5].total_tokens,
                 (long long) collector.stages[6].total_tokens);
     }
 

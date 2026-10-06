@@ -4741,6 +4741,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
 
+    add_opt(common_arg(
+        {"--cascade-sin"}, "N",
+        "sine scaling factor for cascade thought fork perturbation",
+        [](common_params & params, const std::string & value) {
+            params.cascade_sin = std::stof(value);
+        }
+    ).set_env("LLAMA_CASCADE_SIN"));
+
     return ctx_arg;
 }
 

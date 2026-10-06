@@ -262,8 +262,9 @@ void llama_model_gemma4::init_adapter_weights(const char * dir_path) {
     }
 
     if (loaded_count > 0) {
-        fprintf(stderr, "\033[1;36m[Cascade Latent Adapter]\033[0m Successfully activated %zu/%zu lookahead stages\n\n",
-            loaded_count, llama_cascade_config::NUM_STAGES);
+        const float active_sin = params.cascade_sin > 0.0f ? params.cascade_sin : llama_cascade_config::SIN_SCALE;
+        fprintf(stderr, "\033[1;36m[Cascade Latent Adapter]\033[0m Successfully activated %zu/%zu lookahead stages (sin_scale = %.3f)\n\n",
+            loaded_count, llama_cascade_config::NUM_STAGES, active_sin);
         fflush(stderr);
     }
 }
@@ -566,12 +567,12 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             }
         }
 
-        // 3. Fork: spawn new thought stream from current (already fused) representation
+        const float sin_scale = model.get_params().cascade_sin > 0.0f ? model.get_params().cascade_sin : llama_cascade_config::SIN_SCALE;
         for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
             const int32_t fork_l = llama_cascade_config::get_fork_layer(s);
             const auto & stage = model.cascade_stages[s];
             if (il == fork_l && (stage.is_active || is_extracting)) {
-                alt_streams[s] = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), llama_cascade_config::SIN_SCALE));
+                alt_streams[s] = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), sin_scale));
                 cb(alt_streams[s], ("cascade_fork_" + std::to_string(s + 1)).c_str(), il);
             }
         }
