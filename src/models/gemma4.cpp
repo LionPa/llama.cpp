@@ -313,6 +313,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
     ggml_tensor * alt_streams[llama_cascade_config::NUM_STAGES] = { nullptr };
     const bool is_extracting = (cparams.cb_eval != nullptr);
+    bool has_cascade = is_extracting;
+    for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
+        if (model.cascade_stages[s].is_active) {
+            has_cascade = true;
+            break;
+        }
+    }
+    ggml_tensor * inp_sin = has_cascade ? build_inp_cascade_sin(model) : nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
@@ -567,12 +575,12 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             }
         }
 
-        const float sin_scale = model.get_params().cascade_sin > 0.0f ? model.get_params().cascade_sin : llama_cascade_config::SIN_SCALE;
         for (size_t s = 0; s < llama_cascade_config::NUM_STAGES; ++s) {
             const int32_t fork_l = llama_cascade_config::get_fork_layer(s);
             const auto & stage = model.cascade_stages[s];
             if (il == fork_l && (stage.is_active || is_extracting)) {
-                alt_streams[s] = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sin(ctx0, cur), sin_scale));
+                ggml_tensor * scaled_sin = inp_sin ? ggml_mul(ctx0, ggml_sin(ctx0, cur), inp_sin) : ggml_scale(ctx0, ggml_sin(ctx0, cur), llama_cascade_config::SIN_SCALE);
+                alt_streams[s] = ggml_add(ctx0, cur, scaled_sin);
                 cb(alt_streams[s], ("cascade_fork_" + std::to_string(s + 1)).c_str(), il);
             }
         }

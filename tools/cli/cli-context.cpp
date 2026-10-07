@@ -13,13 +13,164 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
+#include <thread>
 
 using json = common_json;
 
+struct brainstorm_config {
+    bool enabled = false;
+    int num_batches = 0;
+    std::vector<float> batch_sins;
+    std::string merger_prompt_template;
+    float merger_sin = 0.05f;
+};
+
+static bool parse_brainstorm_command(const std::string & cmd, brainstorm_config & cfg, std::string & error_msg) {
+    std::string s = string_strip(cmd);
+    if (string_starts_with(s, "/brainstorm")) {
+        s = string_strip(s.substr(11));
+    }
+    if (s.empty()) {
+        if (cfg.enabled) {
+            std::string sins;
+            for (size_t i = 0; i < cfg.batch_sins.size(); ++i) {
+                if (i > 0) sins += ", ";
+                sins += std::to_string(cfg.batch_sins[i]);
+            }
+            error_msg = "Brainstorm mode is ON: " + std::to_string(cfg.num_batches) + " batches [" + sins + "], merger sin = " + std::to_string(cfg.merger_sin) + "\nUse /brainstorm off to disable.";
+        } else {
+            error_msg = "Brainstorm mode is OFF.\nUsage: /brainstorm <batches> <sin_1> ... <sin_N> \"<merger_prompt>\" <sin_merger>\nExample: /brainstorm 3, 0.065, 0.3, 10, \"Merge %1 %2 %3\", 0.065";
+        }
+        return false;
+    }
+    if (s == "off" || s == "disable" || s == "0") {
+        cfg.enabled = false;
+        error_msg = "Brainstorm mode disabled.";
+        return false;
+    }
+
+    std::string clean;
+    bool in_q = false;
+    char q_ch = 0;
+    bool in_paren = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_q) {
+            clean += c;
+            if (c == q_ch && (i == 0 || s[i - 1] != '\\')) {
+                in_q = false;
+            }
+        } else {
+            if (c == '"' || c == '\'') {
+                in_q = true;
+                q_ch = c;
+                clean += c;
+            } else if (c == '(') {
+                in_paren = true;
+            } else if (c == ')') {
+                in_paren = false;
+            } else if (!in_paren) {
+                if (c == ',') {
+                    clean += ' ';
+                } else {
+                    clean += c;
+                }
+            }
+        }
+    }
+
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < clean.size()) {
+        while (i < clean.size() && (clean[i] == ' ' || clean[i] == '\t')) {
+            ++i;
+        }
+        if (i >= clean.size()) break;
+        if (clean[i] == '"' || clean[i] == '\'') {
+            char quote = clean[i++];
+            std::string tok;
+            while (i < clean.size() && clean[i] != quote) {
+                if (clean[i] == '\\' && i + 1 < clean.size()) {
+                    char next = clean[i + 1];
+                    if (next == 'n') tok += '\n';
+                    else if (next == 't') tok += '\t';
+                    else if (next == quote) tok += quote;
+                    else if (next == '\\') tok += '\\';
+                    else { tok += clean[i]; tok += next; }
+                    i += 2;
+                } else {
+                    tok += clean[i++];
+                }
+            }
+            if (i < clean.size() && clean[i] == quote) {
+                ++i;
+            }
+            tokens.push_back(tok);
+        } else {
+            std::string tok;
+            while (i < clean.size() && clean[i] != ' ' && clean[i] != '\t') {
+                tok += clean[i++];
+            }
+            tokens.push_back(tok);
+        }
+    }
+
+    if (tokens.empty()) {
+        error_msg = "Invalid /brainstorm arguments.";
+        return false;
+    }
+
+    int n_batches = 0;
+    try {
+        n_batches = std::stoi(tokens[0]);
+    } catch (...) {
+        error_msg = "Invalid number of batches: " + tokens[0];
+        return false;
+    }
+
+    if (n_batches < 1) {
+        error_msg = "Number of batches must be >= 1.";
+        return false;
+    }
+
+    if (tokens.size() < (size_t)(1 + n_batches + 2)) {
+        error_msg = "Not enough arguments for /brainstorm. Expected: " + std::to_string(n_batches) + " sin values, merger prompt in quotes, and merger sin value.";
+        return false;
+    }
+
+    std::vector<float> sins;
+    for (int b = 0; b < n_batches; ++b) {
+        try {
+            sins.push_back(std::stof(tokens[1 + b]));
+        } catch (...) {
+            error_msg = "Invalid cascade-sin value for batch " + std::to_string(b + 1) + ": " + tokens[1 + b];
+            return false;
+        }
+    }
+
+    std::string merger_prompt = tokens[1 + n_batches];
+    float merger_sin = 0.05f;
+    try {
+        merger_sin = std::stof(tokens[1 + n_batches + 1]);
+    } catch (...) {
+        error_msg = "Invalid cascade-sin value for merger: " + tokens[1 + n_batches + 1];
+        return false;
+    }
+
+    cfg.enabled = true;
+    cfg.num_batches = n_batches;
+    cfg.batch_sins = sins;
+    cfg.merger_prompt_template = merger_prompt;
+    cfg.merger_sin = merger_sin;
+    return true;
+}
+
 struct cli_context_impl {
     json messages      = json::array();
-    json pending_media = json::array(); // staged multimodal content parts
+    json pending_media = json::array();
+    brainstorm_config bs_cfg;
 };
 
 cli_context::cli_context(const common_params & params) : params(params), impl(new cli_context_impl()) {}
@@ -347,15 +498,20 @@ void cli_context::write_output_file(const std::string & content) {
     }
 }
 
-bool cli_context::generate_completion(generated_content & content_out, cli_timings & timings) {
+bool cli_context::generate_completion(generated_content & content_out, cli_timings & timings, float custom_sin) {
     json body = {
         {"messages",          impl->messages},
         {"stream",            true},
-        // in order to get timings even when we cancel mid-way
         {"timings_per_token", true},
     };
     if (!client.model.empty()) {
         body["model"] = client.model;
+    }
+    if (custom_sin >= 0.0f) {
+        body["cascade_sin"] = custom_sin;
+        body["cache_prompt"] = false;
+    } else if (params.cascade_sin >= 0.0f) {
+        body["cascade_sin"] = params.cascade_sin;
     }
 
     bool stream_error = false;
@@ -442,6 +598,7 @@ int cli_context::run() {
     banner += "  /exit or Ctrl+C     stop or exit\n";
     banner += "  /regen              regenerate the last response\n";
     banner += "  /clear              clear the chat history\n";
+    banner += "  /brainstorm ...     toggle brainstorm multi-sin mode\n";
     banner += "  /read <file>        add a text file\n";
     banner += "  /glob <pattern>     add text files using globbing pattern\n";
     if (has_vision) {
@@ -533,6 +690,20 @@ int cli_context::run() {
             impl->pending_media = json::array();
             ui::show_message("Chat history cleared.");
             continue;
+        } else if (string_starts_with(buffer, "/brainstorm")) {
+            std::string err_msg;
+            if (parse_brainstorm_command(buffer, impl->bs_cfg, err_msg)) {
+                std::string sins;
+                for (size_t b = 0; b < impl->bs_cfg.batch_sins.size(); ++b) {
+                    if (b > 0) sins += ", ";
+                    sins += std::to_string(impl->bs_cfg.batch_sins[b]);
+                }
+                ui::show_message(string_format("Brainstorm mode ENABLED:\n  - Batches: %d [%s]\n  - Merger template: \"%s\"\n  - Merger sin: %.4f\nType /brainstorm off to disable.",
+                    impl->bs_cfg.num_batches, sins.c_str(), impl->bs_cfg.merger_prompt_template.c_str(), impl->bs_cfg.merger_sin));
+            } else {
+                ui::show_message(err_msg);
+            }
+            continue;
         } else if (
                 (string_starts_with(buffer, "/image ") && has_vision) ||
                 (string_starts_with(buffer, "/audio ") && has_audio) ||
@@ -612,7 +783,277 @@ int cli_context::run() {
             cur_msg += buffer;
         }
 
-        // generate response
+        if (impl->bs_cfg.enabled && add_user_msg) {
+            std::string user_prompt = cur_msg;
+            push_user_message(user_prompt);
+            write_output_file(string_format("User:\n%s\n\n", user_prompt.c_str()));
+            cur_msg.clear();
+
+            json base_messages = impl->messages;
+            std::vector<std::string> branch_responses(impl->bs_cfg.num_batches);
+            std::vector<generated_content> branch_contents(impl->bs_cfg.num_batches);
+            std::vector<cli_timings> branch_timings(impl->bs_cfg.num_batches);
+            std::vector<bool> branch_success(impl->bs_cfg.num_batches, false);
+            std::mutex out_mutex;
+
+            ui::show_message(string_format("\n>>> [Brainstorm: Launching %d batches in parallel...] <<<\n", impl->bs_cfg.num_batches));
+
+            struct batch_live_stat {
+                std::atomic<int> n_tokens{0};
+                std::atomic<float> speed{0.0f};
+                std::atomic<bool> done{false};
+            };
+            std::vector<std::unique_ptr<batch_live_stat>> live_stats;
+            live_stats.reserve(impl->bs_cfg.num_batches);
+            for (int i = 0; i < impl->bs_cfg.num_batches; ++i) {
+                live_stats.push_back(std::make_unique<batch_live_stat>());
+            }
+
+            std::atomic<bool> ticker_active{true};
+            std::thread ticker([&]() {
+                while (ticker_active.load() && !should_stop()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    if (!ticker_active.load()) {
+                        break;
+                    }
+                    std::string status = "\r\033[K[Brainstorm] ";
+                    for (int i = 0; i < impl->bs_cfg.num_batches; ++i) {
+                        int tok = live_stats[i]->n_tokens.load();
+                        float spd = live_stats[i]->speed.load();
+                        bool d = live_stats[i]->done.load();
+                        if (i > 0) {
+                            status += " | ";
+                        }
+                        if (d) {
+                            status += string_format("B%d: done (%d t)", i + 1, tok);
+                        } else if (tok > 0) {
+                            status += string_format("B%d: %d t (%.1f t/s)", i + 1, tok, spd);
+                        } else {
+                            status += string_format("B%d: starting...", i + 1);
+                        }
+                    }
+                    console::log("%s", status.c_str());
+                    console::flush();
+                }
+            });
+
+            std::vector<std::thread> workers;
+            workers.reserve(impl->bs_cfg.num_batches);
+
+            for (int b = 0; b < impl->bs_cfg.num_batches; ++b) {
+                workers.emplace_back([this, b, &base_messages, &branch_responses, &branch_contents, &branch_timings, &branch_success, &out_mutex, &live_stats]() {
+                    float cur_sin = impl->bs_cfg.batch_sins[b];
+
+                    json body = {
+                        {"messages",          base_messages},
+                        {"stream",            true},
+                        {"timings_per_token", true},
+                        {"cascade_sin",       cur_sin},
+                        {"cache_prompt",      false},
+                    };
+                    if (!client.model.empty()) {
+                        body["model"] = client.model;
+                    }
+
+                    cli_client worker_client = client;
+                    generated_content content_out;
+                    cli_timings timings;
+                    bool stream_error = false;
+
+                    std::string err = worker_client.post_sse("/v1/chat/completions", body.dump(), should_stop, [&](const std::string & payload) {
+                        json chunk = json::parse_no_throw(payload);
+                        if (chunk.is_discarded()) {
+                            return;
+                        }
+                        if (chunk.contains("error")) {
+                            stream_error = true;
+                            std::lock_guard<std::mutex> lock(out_mutex);
+                            ui::show_error(format_error_message(chunk));
+                            return;
+                        }
+                        if (chunk.contains("timings")) {
+                            const auto & t = chunk.at("timings");
+                            timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
+                            timings.predicted_per_second = t.value("predicted_per_second", 0.0);
+                            live_stats[b]->speed.store((float)timings.predicted_per_second);
+                        }
+                        if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
+                            return;
+                        }
+                        const auto & choice = chunk.at("choices").at(0);
+                        if (!choice.contains("delta")) {
+                            return;
+                        }
+                        const auto & delta = choice.at("delta");
+                        if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string()) {
+                            const std::string text = delta.at("reasoning_content").get<std::string>();
+                            if (!text.empty()) {
+                                content_out.reasoning += text;
+                                live_stats[b]->n_tokens.fetch_add(1);
+                            }
+                        }
+                        if (delta.contains("content") && delta.at("content").is_string()) {
+                            const std::string text = delta.at("content").get<std::string>();
+                            if (!text.empty()) {
+                                content_out.content += text;
+                                live_stats[b]->n_tokens.fetch_add(1);
+                            }
+                        }
+                    });
+
+                    if (!err.empty()) {
+                        std::lock_guard<std::mutex> lock(out_mutex);
+                        ui::show_error(format_error_message(err));
+                    } else if (!stream_error) {
+                        branch_success[b] = true;
+                    }
+
+                    branch_contents[b] = std::move(content_out);
+                    branch_timings[b] = timings;
+
+                    if (!branch_contents[b].content.empty()) {
+                        branch_responses[b] = branch_contents[b].content;
+                    } else {
+                        branch_responses[b] = "[Ответ отсутствует: размышление не закончилось / No response: thinking was not completed]";
+                    }
+                    live_stats[b]->done.store(true);
+                });
+            }
+
+            for (auto & th : workers) {
+                if (th.joinable()) {
+                    th.join();
+                }
+            }
+
+            ticker_active.store(false);
+            if (ticker.joinable()) {
+                ticker.join();
+            }
+            console::log("\r\033[K");
+            console::flush();
+
+            for (int b = 0; b < impl->bs_cfg.num_batches; ++b) {
+                float cur_sin = impl->bs_cfg.batch_sins[b];
+                ui::show_message(string_format("\n>>> [Brainstorm Batch %d/%d | cascade-sin = %.4f] <<<\n", b + 1, impl->bs_cfg.num_batches, cur_sin));
+                if (!branch_contents[b].reasoning.empty()) {
+                    ui::show_message("[Start thinking]\n" + branch_contents[b].reasoning + "\n[End thinking]\n\n");
+                }
+                if (!branch_contents[b].content.empty()) {
+                    ui::show_message(branch_contents[b].content + "\n");
+                } else {
+                    ui::show_message("[Ответ отсутствует: размышление не закончилось]\n");
+                }
+
+                if (output_file) {
+                    std::string out_branch = string_format("Assistant [Batch %d (sin=%.4f)]:\n", b + 1, cur_sin);
+                    if (!branch_contents[b].reasoning.empty()) {
+                        out_branch += "[Start thinking]\n\n" + branch_contents[b].reasoning + "[End thinking]\n\n";
+                    }
+                    if (!branch_contents[b].content.empty()) {
+                        out_branch += branch_contents[b].content + "\n\n";
+                    } else {
+                        out_branch += "[Ответ отсутствует: размышление не закончилось]\n\n";
+                    }
+                    write_output_file(out_branch);
+                }
+
+                if (params.show_timings) {
+                    ui::show_info(string_format(
+                        "[ Batch %d: %.1f t/s (prompt: %.1f t/s) ]",
+                        b + 1,
+                        branch_timings[b].predicted_per_second,
+                        branch_timings[b].prompt_per_second
+                    ));
+                }
+            }
+
+            cli_context::interrupted().store(false);
+
+            bool all_success = !should_stop();
+            for (bool s : branch_success) {
+                if (!s) {
+                    all_success = false;
+                    break;
+                }
+            }
+
+            if (all_success) {
+                std::string merger_input = impl->bs_cfg.merger_prompt_template;
+                for (int b = 0; b < impl->bs_cfg.num_batches; ++b) {
+                    std::string placeholder = "%" + std::to_string(b + 1);
+                    size_t pos = 0;
+                    while ((pos = merger_input.find(placeholder, pos)) != std::string::npos) {
+                        merger_input.replace(pos, placeholder.length(), branch_responses[b]);
+                        pos += branch_responses[b].length();
+                    }
+                    std::string sin_placeholder = "%sin" + std::to_string(b + 1);
+                    std::string sin_val_str = string_format("%.4f", impl->bs_cfg.batch_sins[b]);
+                    size_t spos = 0;
+                    while ((spos = merger_input.find(sin_placeholder, spos)) != std::string::npos) {
+                        merger_input.replace(spos, sin_placeholder.length(), sin_val_str);
+                        spos += sin_val_str.length();
+                    }
+                }
+                size_t ppos = 0;
+                while ((ppos = merger_input.find("%prompt%", ppos)) != std::string::npos) {
+                    merger_input.replace(ppos, 8, user_prompt);
+                    ppos += user_prompt.length();
+                }
+                size_t ppos0 = 0;
+                while ((ppos0 = merger_input.find("%0", ppos0)) != std::string::npos) {
+                    merger_input.replace(ppos0, 2, user_prompt);
+                    ppos0 += user_prompt.length();
+                }
+
+                ui::show_message(string_format("\n>>> [Brainstorm Merger | cascade-sin = %.4f] <<<\n", impl->bs_cfg.merger_sin));
+
+                impl->messages = base_messages;
+                impl->messages.push_back({
+                    {"role", "user"},
+                    {"content", merger_input}
+                });
+
+                cli_timings merger_timings;
+                generated_content merger_content;
+                generate_completion(merger_content, merger_timings, impl->bs_cfg.merger_sin);
+
+                impl->messages = base_messages;
+                json final_msg = {
+                    {"role", "assistant"},
+                    {"content", merger_content.content}
+                };
+                if (!merger_content.reasoning.empty()) {
+                    final_msg["reasoning_content"] = merger_content.reasoning;
+                }
+                impl->messages.push_back(std::move(final_msg));
+
+                if (output_file) {
+                    std::string out_merger = string_format("Assistant [Merger (sin=%.4f)]:\n", impl->bs_cfg.merger_sin);
+                    if (!merger_content.reasoning.empty()) {
+                        out_merger += "[Start thinking]\n\n" + merger_content.reasoning + "[End thinking]\n\n";
+                    }
+                    out_merger += merger_content.content + "\n\n";
+                    write_output_file(out_merger);
+                }
+
+                if (params.show_timings) {
+                    ui::show_info(string_format(
+                        "\n[ Prompt: %.1f t/s | Generation: %.1f t/s | \033[1;36m\xE2\x9A\xA1 Cascade: 7-Stage Lookahead (L24..L30 -> L26..L32, FP16)\033[0m ]",
+                        merger_timings.prompt_per_second,
+                        merger_timings.predicted_per_second
+                    ));
+                }
+            } else {
+                ui::show_error("Brainstorm batches incomplete or aborted.");
+            }
+
+            if (params.single_turn) {
+                break;
+            }
+            continue;
+        }
+
         if (add_user_msg) {
             push_user_message(cur_msg);
             write_output_file(string_format("User:\n%s\n\n", cur_msg.c_str()));

@@ -549,6 +549,9 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    LLAMA_API void llama_model_set_cascade_sin(struct llama_model * model, float cascade_sin);
+    LLAMA_API float llama_model_get_cascade_sin(const struct llama_model * model);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);
@@ -675,6 +678,11 @@ extern "C" {
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
+
+    LLAMA_API void llama_model_set_cascade_sin(struct llama_model * model, float cascade_sin);
+    LLAMA_API float llama_model_get_cascade_sin(const struct llama_model * model);
+    LLAMA_API void llama_model_set_cascade_sin_seq(struct llama_model * model, llama_seq_id seq_id, float sin);
+    LLAMA_API float llama_model_get_cascade_sin_seq(const struct llama_model * model, llama_seq_id seq_id);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(

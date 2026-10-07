@@ -40,7 +40,7 @@ struct cli_server {
 
         is_alive.store(true, std::memory_order_release);
 
-        common_params server_params = params; // copy
+        common_params server_params = params;
         server_params.port = port;
 
         th = std::thread([this, server_params]() mutable {

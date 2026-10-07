@@ -56,7 +56,7 @@ private:
         std::string reasoning;
         std::string content;
     };
-    bool generate_completion(generated_content & content_out, cli_timings & timings);
+    bool generate_completion(generated_content & content_out, cli_timings & timings, float custom_sin = -1.0f);
     void fetch_server_props();
     void add_system_prompt();
     void push_user_message(const std::string & text);

@@ -173,6 +173,26 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_cascade_sin::llm_graph_input_cascade_sin(const llama_model & model) : model(model) {}
+
+void llm_graph_input_cascade_sin::set_input(const llama_ubatch * ubatch) {
+    if (inp_sin) {
+        const int64_t n_tokens = ubatch->n_tokens;
+        std::vector<float> sin_data(n_tokens, 0.0f);
+        const float default_sin = model.get_params().cascade_sin >= 0.0f ? model.get_params().cascade_sin : llama_cascade_config::SIN_SCALE;
+        for (int i = 0; i < n_tokens; ++i) {
+            llama_seq_id sid = (ubatch->seq_id && ubatch->seq_id[i]) ? ubatch->seq_id[i][0] : 0;
+            float s = model.get_cascade_sin_seq(sid);
+            sin_data[i] = (s >= 0.0f) ? s : default_sin;
+        }
+        ggml_backend_tensor_set(inp_sin, sin_data.data(), 0, n_tokens * sizeof(float));
+    }
+}
+
+bool llm_graph_input_cascade_sin::can_reuse(const llm_graph_params & params) {
+    return inp_sin && inp_sin->ne[1] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -2480,6 +2500,20 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     cur = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
     ggml_set_input(cur);
     cb(cur, "inp_attn_scale", -1);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_cascade_sin(const llama_model & model) const {
+    auto inp = std::make_unique<llm_graph_input_cascade_sin>(model);
+
+    auto & cur = inp->inp_sin;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+    ggml_set_input(cur);
+    cb(cur, "inp_cascade_sin", -1);
 
     res->add_input(std::move(inp));
 

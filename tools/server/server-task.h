@@ -94,8 +94,8 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
-    // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+    float cascade_sin = -1.0f;
 
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;

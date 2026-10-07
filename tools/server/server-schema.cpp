@@ -81,6 +81,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.response_fields = json_value(data, "response_fields", std::vector<std::string>());
         }));
 
+    add((new field_num<float>("cascade_sin", params.cascade_sin))
+        ->set_limits(-1.0f, 10000.0f));
+
 
     //
     // Sampling params

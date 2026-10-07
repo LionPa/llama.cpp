@@ -1272,6 +1272,7 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    seq_cascade_sin.fill(-1.0f);
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -3435,3 +3436,27 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+
+void llama_model_set_cascade_sin(struct llama_model * model, float cascade_sin) {
+    if (model) {
+        model->set_cascade_sin(cascade_sin);
+    }
+}
+
+float llama_model_get_cascade_sin(const struct llama_model * model) {
+    if (model) {
+        return model->get_params().cascade_sin;
+    }
+    return 0.0f;
+}
+
+void llama_model_set_cascade_sin_seq(struct llama_model * model, llama_seq_id seq_id, float sin) {
+    if (model) {
+        model->set_cascade_sin_seq(seq_id, sin);
+    }
+}
+
+float llama_model_get_cascade_sin_seq(const struct llama_model * model, llama_seq_id seq_id) {
+    return model ? model->get_cascade_sin_seq(seq_id) : -1.0f;
+}
+

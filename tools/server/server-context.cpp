@@ -556,6 +556,13 @@ struct server_slot {
                 prompt_clear();
             }
 
+            if (ctx_tgt) {
+                llama_model_set_cascade_sin_seq(const_cast<llama_model *>(llama_get_model(ctx_tgt)), id, -1.0f);
+            }
+            if (ctx_dft) {
+                llama_model_set_cascade_sin_seq(const_cast<llama_model *>(llama_get_model(ctx_dft)), id, -1.0f);
+            }
+
             callback_on_reset(*this);
 
             reset();
@@ -1773,6 +1780,13 @@ private:
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
+        }
+
+        if (task.params.cascade_sin >= 0.0f) {
+            llama_model_set_cascade_sin_seq(model_tgt, slot.id, task.params.cascade_sin);
+            if (model_dft) {
+                llama_model_set_cascade_sin_seq(model_dft, slot.id, task.params.cascade_sin);
+            }
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
@@ -4317,6 +4331,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+            task.params.cascade_sin = json_value(data, "cascade_sin", task.params.cascade_sin);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 

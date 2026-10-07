@@ -7,12 +7,15 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "llama-cparams.h"
 
 struct llama_cparams;
 struct llama_ubatch;
@@ -816,7 +819,20 @@ struct llama_model {
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+    std::array<float, LLAMA_MAX_SEQ> seq_cascade_sin;
     const llama_model_params & get_params() const { return params; }
+    void set_cascade_sin(float sin) { params.cascade_sin = sin; }
+    void set_cascade_sin_seq(llama_seq_id seq_id, float sin) {
+        if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
+            seq_cascade_sin[seq_id] = sin;
+        }
+    }
+    float get_cascade_sin_seq(llama_seq_id seq_id) const {
+        if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ && seq_cascade_sin[seq_id] >= 0.0f) {
+            return seq_cascade_sin[seq_id];
+        }
+        return params.cascade_sin >= 0.0f ? params.cascade_sin : llama_cascade_config::SIN_SCALE;
+    }
 
 protected:
     llama_model_params params;

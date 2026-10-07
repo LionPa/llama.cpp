@@ -187,6 +187,19 @@ public:
     const float    f_attn_temp_offset;
 };
 
+class llm_graph_input_cascade_sin : public llm_graph_input_i {
+public:
+    llm_graph_input_cascade_sin(const llama_model & model);
+    virtual ~llm_graph_input_cascade_sin() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * inp_sin = nullptr;
+
+    const llama_model & model;
+};
+
 class llm_graph_input_pos_bucket : public llm_graph_input_i {
 public:
     llm_graph_input_pos_bucket(const llama_hparams & hparams) : hparams(hparams) {}
@@ -1363,6 +1376,8 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    ggml_tensor * build_inp_cascade_sin(const llama_model & model) const;
 
     //
     // pooling
