@@ -529,7 +529,8 @@ struct common_params {
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::string cascade_dir = "";
-    float cascade_sin = 0.05f;
+    float cascade_sin = 1.0f;
+    int32_t cpt_train_port = 0;
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale

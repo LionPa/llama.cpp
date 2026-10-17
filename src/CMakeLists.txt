@@ -16,6 +16,7 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-cparams.cpp
+    llama-cpt.cpp
     llama-grammar.cpp
     llama-graph.cpp
     llama-hparams.cpp
@@ -69,6 +70,9 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+if (WIN32)
+    target_link_libraries(llama PRIVATE ws2_32)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

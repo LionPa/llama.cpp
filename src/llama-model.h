@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-cpt.h"
 
 #include <array>
 #include <map>
@@ -732,6 +733,7 @@ struct llama_model {
     // Cascaded Latent Thoughts
     llama_cascade_stage   cascade_stages[llama_cascade_config::NUM_STAGES] = {};
     ggml_backend_buffer_t cascade_adapter_buf = nullptr;
+    llama_cpt_model       cpt;
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
@@ -831,7 +833,7 @@ struct llama_model {
         if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ && seq_cascade_sin[seq_id] >= 0.0f) {
             return seq_cascade_sin[seq_id];
         }
-        return params.cascade_sin >= 0.0f ? params.cascade_sin : llama_cascade_config::SIN_SCALE;
+        return params.cascade_sin >= 0.0f ? params.cascade_sin : 1.0f;
     }
 
 protected:

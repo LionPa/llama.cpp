@@ -4749,6 +4749,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_CASCADE_SIN"));
 
+    add_opt(common_arg(
+        {"--cpt-train-port", "--cascade-train-port", "--cascade-train"}, "N",
+        "tcp streaming port for cpt online trainer",
+        [](common_params & params, const std::string & value) {
+            params.cpt_train_port = std::stoi(value);
+        }
+    ).set_env("LLAMA_CPT_TRAIN_PORT"));
+
     return ctx_arg;
 }
 

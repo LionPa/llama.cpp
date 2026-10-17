@@ -356,6 +356,7 @@ extern "C" {
 
         const char * cascade_dir;
         float cascade_sin;
+        int32_t cpt_train_port;
     };
 
     struct llama_sampler_seq_config {
@@ -1739,6 +1740,8 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+    LLAMA_API bool llama_cpt_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
 
 #ifdef __cplusplus
 }

@@ -1290,6 +1290,7 @@ llama_model::~llama_model() {
         ggml_backend_buffer_free(cascade_adapter_buf);
         cascade_adapter_buf = nullptr;
     }
+    llama_cpt_free_weights(cpt);
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2879,6 +2880,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mtp                    =*/ false,
         /*.cascade_dir                 =*/ nullptr,
         0.05f,
+        0,
     };
 
     return result;

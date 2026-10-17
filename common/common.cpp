@@ -1666,6 +1666,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     mparams.cascade_dir                 = params.cascade_dir.empty() ? nullptr : params.cascade_dir.c_str();
     mparams.cascade_sin                 = params.cascade_sin;
+    mparams.cpt_train_port              = params.cpt_train_port;
 
     return mparams;
 }
@@ -1697,6 +1698,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    int train_port = params.cpt_train_port;
+    if (train_port <= 0) {
+        const char * env_port = std::getenv("LLAMA_CPT_TRAIN_PORT");
+        if (env_port && env_port[0] != '\0') {
+            train_port = std::atoi(env_port);
+        }
+    }
+    if (train_port > 0 && !cparams.cb_eval) {
+        cparams.cb_eval = llama_cpt_eval_callback;
+        cparams.cb_eval_user_data = (void *)(intptr_t) train_port;
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

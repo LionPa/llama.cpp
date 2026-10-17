@@ -179,7 +179,7 @@ void llm_graph_input_cascade_sin::set_input(const llama_ubatch * ubatch) {
     if (inp_sin) {
         const int64_t n_tokens = ubatch->n_tokens;
         std::vector<float> sin_data(n_tokens, 0.0f);
-        const float default_sin = model.get_params().cascade_sin >= 0.0f ? model.get_params().cascade_sin : llama_cascade_config::SIN_SCALE;
+        const float default_sin = model.get_params().cascade_sin >= 0.0f ? model.get_params().cascade_sin : 1.0f;
         for (int i = 0; i < n_tokens; ++i) {
             llama_seq_id sid = (ubatch->seq_id && ubatch->seq_id[i]) ? ubatch->seq_id[i][0] : 0;
             float s = model.get_cascade_sin_seq(sid);
