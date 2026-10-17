@@ -1039,7 +1039,7 @@ int cli_context::run() {
 
                 if (params.show_timings) {
                     ui::show_info(string_format(
-                        "\n[ Prompt: %.1f t/s | Generation: %.1f t/s | \033[1;36m\xE2\x9A\xA1 Cascade: 7-Stage Lookahead (L24..L30 -> L26..L32, FP16)\033[0m ]",
+                        "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
                         merger_timings.prompt_per_second,
                         merger_timings.predicted_per_second
                     ));
@@ -1090,7 +1090,7 @@ int cli_context::run() {
 
         if (params.show_timings) {
             ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s | \033[1;36m\xE2\x9A\xA1 Cascade: 7-Stage Lookahead (L24..L30 -> L26..L32, FP16)\033[0m ]",
+                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
                 timings.prompt_per_second,
                 timings.predicted_per_second
             ));
