@@ -92,24 +92,86 @@ cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release -j
 ```
 
-### Inference Example
-Run `llama-cli` with full GPU offloading, Flash Attention, CPT steering, MTP speculative decoding, and parallel Brainstorm slots:
+---
 
+### Setup: Models and CPT Weights
+
+1. **Base Model:** Download [Gemma 4 12B it QAT Q4_0](https://huggingface.co/lmstudio-community/gemma-4-12B-it-QAT-GGUF) into `./models/`.
+2. **Draft Assistant (MTP):** Download [Gemma 4 12B MTP Q8_0 Assistant](https://huggingface.co/Janvitos/gemma-4-12B-it-qat-assistant-MTP-Q8_0-GGUF) into `./models/`.
+3. **CPT Weights:** Download `gemma-4-12b-qat-cpt-weights.zip` from [GitHub Releases](https://github.com/LionPa/llama.cpp/releases) and extract to `./cpt_weights/` (contains `w_merge_*.bin`, `gate_*.bin`, `sin_scale.bin`).
+
+---
+
+### Server Mode (`llama-server`)
+
+The `-np` flag sets the number of parallel sequence slots (batches). It must be equal to or greater than the number of candidates you plan to run simultaneously:
+
+**Windows (PowerShell):**
+```powershell
+& ".\build\bin\Release\llama-server.exe" `
+    -m "./models/gemma-4-12B-it-QAT-Q4_0.gguf" `
+    --model-draft "./models/gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf" `
+    --spec-type draft-mtp `
+    --spec-draft-n-max 4 `
+    -ngl 99 -fa on -c 100000 `
+    --cascade-dir "./cpt_weights" `
+    --cascade-sin 1.0 `
+    --repeat-penalty 1.15 `
+    -np 4 --port 8080 --temp 0.2
+```
+
+**Linux (Bash):**
 ```sh
-./build/bin/Release/llama-cli \
+./build/bin/Release/llama-server \
     -m ./models/gemma-4-12B-it-QAT-Q4_0.gguf \
-    --cascade-dir ./weights/CascadeLearning \
-    --cascade-sin 1.0 \
     --model-draft ./models/gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf \
     --spec-type draft-mtp \
     --spec-draft-n-max 4 \
-    -ngl 99 \
-    -fa on \
-    -c 100000 \
-    -np 3 \
-    --temp 0.2 \
+    -ngl 99 -fa on -c 100000 \
+    --cascade-dir ./cpt_weights \
+    --cascade-sin 1.0 \
+    --repeat-penalty 1.15 \
+    -np 4 --port 8080 --temp 0.2
+```
+
+---
+
+### Interactive CLI with Adversarial Brainstorm
+
+To use Brainstorm in interactive chat, set `-np` to at least the number of candidates (e.g. `-np 3` for a 3-way brainstorm):
+
+**Windows (PowerShell):**
+```powershell
+& ".\build\bin\Release\llama-cli.exe" `
+    -m "./models/gemma-4-12B-it-QAT-Q4_0.gguf" `
+    --model-draft "./models/gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf" `
+    --spec-type draft-mtp `
+    --spec-draft-n-max 4 `
+    -ngl 99 -fa on -c 100000 `
+    --cascade-dir "./cpt_weights" `
+    --cascade-sin 1.0 `
+    --repeat-penalty 1.1 `
+    -np 3 --temp 0.2
+```
+
+**Linux (Bash):**
+```sh
+./build/bin/Release/llama-cli \
+    -m ./models/gemma-4-12B-it-QAT-Q4_0.gguf \
+    --model-draft ./models/gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf \
+    --spec-type draft-mtp \
+    --spec-draft-n-max 4 \
+    -ngl 99 -fa on -c 100000 \
+    --cascade-dir ./cpt_weights \
+    --cascade-sin 1.0 \
     --repeat-penalty 1.1 \
-    -p "Your prompt here"
+    -np 3 --temp 0.2
+```
+
+In the interactive prompt, paste the `/brainstorm` command as a single line:
+
+```text
+/brainstorm 3, 1.0, 4.6, 23, "Review my original request and the 3 distinct candidates developed below:\n\n[Candidate 1 | Conventional & Grounded]:\n%1\n\n[Candidate 2 | Balanced & Adaptive]:\n%2\n\n[Candidate 3 | Lateral & Unconventional]:\n%3\n\nCONTEXT & NATURE OF CANDIDATES:\nThe three candidates above explore the problem from different analytical angles:\n- Candidate 1: Conventional and strictly grounded in core constraints.\n- Candidate 2: Balanced, capturing nuanced interactions and trade-offs.\n- Candidate 3: Lateral perspective, exploring non-obvious mechanisms and edge cases.\n\nCRITICAL INSTRUCTIONS:\n1. ROLE & HUMILITY (NO SELF-SOLVING): You are an Adversarial Code Reviewer and Lead Editor. You are NOT the author and you are NOT smarter than the collective candidates. DO NOT attempt to solve the problem from scratch, do not invent new architectures, and do not brainstorm alternatives. The correct solution already exists across these candidates.\n2. ADVERSARIAL AUDIT (NO CANDIDATE IS PERFECT): Never assume any single candidate is 100% flawless. Assume each candidate has at least one subtle bug (unhandled edge cases, off-by-one errors, dimensional mismatches, or missing syntax/imports). Cross-examine the candidates against each other to expose and eliminate these silent errors.\n3. SELECT THE PRIMARY BACKBONE (85-95%): Identify which Candidate provides the most complete, concrete, and production-ready solution (explicit formulas, fully written code without placeholders/TODOs). Adopt this candidate as your single architectural backbone.\n4. SURGICAL PATCHING: Patch the backbone locally using specific bug-fixes and edge-case handling from secondary candidates. Screen Candidate 3 for clever algorithmic optimizations or rare safeguards, and cleanly graft them into the backbone.\n5. NO INVENTED ENTITIES: Never introduce arbitrary variables, external libraries, or unrequested assumptions not present in the prompt or candidates.\n6. FINAL OUTPUT: Produce a seamless, complete, publication-ready response. Output ONLY the deliverable without meta-talk, introductions, or mentions of 'candidates', 'reviews', or the synthesis process.", 1.0
 ```
 
 ---
